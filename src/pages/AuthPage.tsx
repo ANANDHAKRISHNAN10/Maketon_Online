@@ -1,268 +1,62 @@
-import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { ShieldAlert, UserCheck, Lock } from 'lucide-react';
+import { useState, type FormEvent } from 'react';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { ArrowLeft, ArrowRight, Check, Eye, EyeOff, Gamepad2, Gift, LockKeyhole, Mail, ShieldCheck, Sparkles, UserRound } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { HeroControllerIllustration } from '../components/GameIllustrations';
+
+type Mode = 'login' | 'register' | 'reset';
+const rolePath = (role: string) => role === 'GAMER' ? '/customer/dashboard' : '/admin/dashboard';
 
 export function AuthPage() {
   const { loginWithToken, demoAccounts, quickSwitchAccount } = useAuth();
   const navigate = useNavigate();
-
-  const [mode, setMode] = useState<'login' | 'register'>('login');
+  const { pathname } = useLocation();
+  const [mode, setMode] = useState<Mode>(pathname === '/register' ? 'register' : 'login');
   const [name, setName] = useState('');
-  const [email, setEmail] = useState('alex@gamer.gg');
+  const [email, setEmail] = useState(() => localStorage.getItem('brightloop_remembered_email') || 'alex@gamer.gg');
   const [password, setPassword] = useState('GamerPass!123');
-  const [parentEmail, setParentEmail] = useState('');
-  const [parentalPin, setParentalPin] = useState('');
-  const [simulatedCountry, setSimulatedCountry] = useState('US');
-  const [error, setError] = useState<string | null>(null);
-  const [geoWarning, setGeoWarning] = useState<string | null>(null);
+  const [showPassword, setShowPassword] = useState(false);
+  const [remember, setRemember] = useState(true);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [loading, setLoading] = useState(false);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError(null);
-    setGeoWarning(null);
+  const setPageMode = (next: Mode) => { setMode(next); setError(''); setNotice(''); if (next === 'login') navigate('/login', { replace: true }); if (next === 'register') navigate('/register', { replace: true }); };
+  const submit = async (event: FormEvent) => {
+    event.preventDefault(); setError(''); setNotice('');
+    const cleanEmail = email.trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) { setError('Enter a valid email address, such as player@example.com.'); return; }
+    if (mode === 'reset') { setNotice('If an account exists for this email, reset instructions would be sent. For this demo, contact hello@brightloop.gg to reset access.'); return; }
+    if (password.length < 6) { setError('Your password must be at least 6 characters.'); return; }
+    if (mode === 'register' && name.trim().length < 2) { setError('Enter a player name with at least 2 characters.'); return; }
     setLoading(true);
-
     try {
-      const endpoint = mode === 'login' ? '/api/auth/login' : '/api/auth/register';
-      const payload =
-        mode === 'login'
-          ? { email, password, simulatedCountry }
-          : { name, email, password, parentEmail, parentalPin };
-
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error || 'Authentication failed.');
-      } else {
-        loginWithToken(data.token, data.user);
-        if (data.geoJumpDetected) {
-          setGeoWarning(
-            'Geo-IP Jump Detected (Country changed within 1 hour)! A 48-hour Trade Lock has been placed on your account and logged in Security Center.'
-          );
-          setTimeout(() => {
-            navigate(data.user.role === 'GAMER' ? '/gamer' : '/admin');
-          }, 2200);
-        } else {
-          navigate(data.user.role === 'GAMER' ? '/gamer' : '/admin');
-        }
-      }
-    } catch {
-      setError('Network error during authentication.');
-    } finally {
-      setLoading(false);
-    }
+      const isLogin = mode === 'login';
+      const response = await fetch(isLogin ? '/api/auth/login' : '/api/auth/register', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(isLogin ? { email: cleanEmail, password, simulatedCountry: 'US' } : { name: name.trim(), email: cleanEmail, password }) });
+      const data = await response.json();
+      if (!response.ok) { setError(data.message || data.error || 'We could not sign you in. Check your details and try again.'); return; }
+      loginWithToken(data.token, data.user);
+      if (remember) localStorage.setItem('brightloop_remembered_email', cleanEmail); else localStorage.removeItem('brightloop_remembered_email');
+      navigate(rolePath(data.user.role));
+    } catch { setError('We could not reach Brightloop. Check your connection and try again.'); }
+    finally { setLoading(false); }
   };
 
-  return (
-    <div className="min-h-screen bg-[#FFFBF5] py-16 px-6">
-      <div className="max-w-5xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-10 items-start">
-        {/* Left column: Form */}
-        <div className="lg:col-span-7 bg-white rounded-3xl border border-orange-200/80 p-8 shadow-sm">
-          <div className="flex items-center gap-2 p-1 bg-orange-100/70 rounded-xl w-fit mb-6">
-            <button
-              type="button"
-              onClick={() => setMode('login')}
-              className={`px-4 py-2 text-xs font-bold rounded-lg transition-colors cursor-pointer ${
-                mode === 'login' ? 'bg-white text-orange-600 shadow-xs' : 'text-stone-600'
-              }`}
-            >
-              Sign In
-            </button>
-            <button
-              type="button"
-              onClick={() => setMode('register')}
-              className={`px-4 py-2 text-xs font-bold rounded-lg transition-colors cursor-pointer ${
-                mode === 'register' ? 'bg-white text-orange-600 shadow-xs' : 'text-stone-600'
-              }`}
-            >
-              Create Gamer Account
-            </button>
-          </div>
+  const demoLogin = async (id: string) => { setError(''); setLoading(true); try { const user = await quickSwitchAccount(id); if (user) navigate(rolePath(user.role)); else setError('This demo account could not be opened. Try signing in with its credentials.'); } catch { setError('We could not reach the demo account service. Try again.'); } finally { setLoading(false); } };
+  const isReset = mode === 'reset';
+  return <main className="min-h-screen bg-[#f5f4f0] p-4 sm:p-6 lg:p-8"><div className="mx-auto grid min-h-[700px] max-w-[1340px] overflow-hidden rounded-[32px] bg-white shadow-[0_24px_70px_rgba(45,38,24,.10)] lg:min-h-[calc(100vh-64px)] lg:grid-cols-[.95fr_1.05fr]">
+    <section className="relative isolate flex min-h-[430px] flex-col overflow-hidden bg-gradient-to-br from-[#ff941f] via-[#ffad27] to-[#ffc928] px-7 py-7 text-white sm:px-10 lg:min-h-full lg:px-12 lg:py-10"><div className="pointer-events-none absolute -right-28 top-24 h-96 w-96 rounded-full border border-white/20"/><div className="pointer-events-none absolute -right-12 top-40 h-64 w-64 rounded-full border border-white/20"/><Link to="/" className="relative z-10 inline-flex w-fit items-center gap-2.5 font-display text-lg font-extrabold"><span className="grid h-10 w-10 place-items-center rounded-xl bg-white/20"><Gamepad2 size={22}/></span>Brightloop Gaming</Link><div className="relative z-10 my-auto grid items-center gap-4 py-8 md:grid-cols-[1fr_.9fr] lg:my-0 lg:grid-cols-1 lg:py-0"><div><div className="mb-5 inline-flex items-center gap-2 rounded-full border border-white/35 bg-white/15 px-3 py-1.5 text-[11px] font-semibold backdrop-blur"><Sparkles size={13}/> YOUR NEXT ADVENTURE STARTS HERE</div><h1 className="max-w-[520px] font-display text-4xl font-extrabold leading-[1.05] tracking-[-.04em] sm:text-5xl">Welcome Back,<br/>Gamer<span className="text-[#fff0b1]">!</span></h1><p className="mt-4 max-w-[400px] text-sm leading-6 text-white/90 sm:text-base">Pick up where you left off. Manage your subscriptions, discover rewards and keep your gaming world in sync.</p><div className="mt-6 flex flex-wrap gap-4 text-xs font-medium text-white/90"><span className="inline-flex items-center gap-1.5"><Gift size={15}/> Player rewards</span><span className="inline-flex items-center gap-1.5"><ShieldCheck size={15}/> Account protection</span></div></div><div className="relative mx-auto w-full max-w-[310px] md:max-w-[250px] lg:mx-0 lg:mt-4 lg:max-w-[370px]"><div className="absolute inset-7 rounded-full bg-[#fff1b1]/60 blur-3xl"/><div className="relative scale-[.8] sm:scale-[.85] lg:scale-100"><HeroControllerIllustration/></div></div></div><div className="relative z-10 hidden items-center gap-2 border-t border-white/25 pt-5 text-xs text-white/80 sm:flex"><Check size={15}/> One account for your whole gaming life.</div></section>
 
-          <h1 className="font-display text-2xl font-extrabold text-stone-900">
-            {mode === 'login' ? 'Welcome Back to Brightloop' : 'Create Your Brightloop Pass Account'}
-          </h1>
-          <p className="text-sm text-stone-600 mt-1 mb-6">
-            {mode === 'login'
-              ? 'Access your Battlepass, download GST invoices, or manage platform operations.'
-              : 'Includes instant Monthly Champion Tier provisioning and optional Parental Safety Gate PIN.'}
-          </p>
-
-          <form onSubmit={handleSubmit} className="space-y-4">
-            {mode === 'register' && (
-              <div>
-                <label className="block text-xs font-semibold text-stone-700 mb-1">Gamer Display Name</label>
-                <input
-                  type="text"
-                  required
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  placeholder="Jordan Vance"
-                  className="w-full px-4 py-2.5 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
-                />
-              </div>
-            )}
-
-            <div>
-              <label className="block text-xs font-semibold text-stone-700 mb-1">Email Address</label>
-              <input
-                type="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                className="w-full px-4 py-2.5 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-stone-700 mb-1">Password</label>
-              <input
-                type="password"
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className="w-full px-4 py-2.5 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
-              />
-            </div>
-
-            {mode === 'login' && (
-              <div className="p-3.5 bg-amber-50/70 border border-orange-200/80 rounded-2xl">
-                <label className="block text-xs font-semibold text-stone-800 mb-1">
-                  Login Country (Geo-IP Jump Security Test)
-                </label>
-                <select
-                  value={simulatedCountry}
-                  onChange={(e) => setSimulatedCountry(e.target.value)}
-                  className="w-full px-3 py-2 text-xs bg-white border border-stone-200 rounded-lg"
-                >
-                  <option value="US">United States (US — Normal Session)</option>
-                  <option value="JP">Japan (JP — Triggers 1-Hour Geo-IP Jump & 48h Trade Lock)</option>
-                  <option value="DE">Germany (DE — Triggers 1-Hour Geo-IP Jump & 48h Trade Lock)</option>
-                </select>
-              </div>
-            )}
-
-            {mode === 'register' && (
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
-                <div>
-                  <label className="block text-xs font-semibold text-stone-700 mb-1">
-                    Parent Email (Optional)
-                  </label>
-                  <input
-                    type="email"
-                    value={parentEmail}
-                    onChange={(e) => setParentEmail(e.target.value)}
-                    placeholder="parent@family.org"
-                    className="w-full px-3.5 py-2 text-sm border border-stone-200 rounded-xl"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-stone-700 mb-1">
-                    4-Digit Parental PIN (Optional)
-                  </label>
-                  <input
-                    type="password"
-                    maxLength={4}
-                    value={parentalPin}
-                    onChange={(e) => setParentalPin(e.target.value)}
-                    placeholder="4210"
-                    className="w-full px-3.5 py-2 text-sm font-mono border border-stone-200 rounded-xl"
-                  />
-                </div>
-              </div>
-            )}
-
-            {error && (
-              <div className="p-3.5 bg-red-50 border border-red-200 text-red-800 text-xs font-medium rounded-xl">
-                {error}
-              </div>
-            )}
-
-            {geoWarning && (
-              <div className="p-4 bg-amber-50 border border-amber-300 text-amber-900 text-xs font-semibold rounded-xl flex items-start gap-2.5">
-                <ShieldAlert className="w-5 h-5 text-amber-600 shrink-0" />
-                <span>{geoWarning}</span>
-              </div>
-            )}
-
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full py-3.5 px-6 bg-orange-600 hover:bg-orange-700 text-white font-display font-bold text-sm rounded-2xl shadow-sm transition-colors cursor-pointer"
-            >
-              {loading ? 'Authenticating...' : mode === 'login' ? 'Sign In to Brightloop' : 'Create Account & Start Pass'}
-            </button>
-          </form>
-        </div>
-
-        {/* Right column: Seeded Role Accounts for Instant Evaluation */}
-        <div className="lg:col-span-5 bg-white rounded-3xl border border-orange-200/80 p-6 shadow-sm space-y-4">
-          <div className="flex items-center gap-2 text-orange-600 text-xs font-semibold">
-            <UserCheck className="w-4 h-4" />
-            <span>Seeded Accounts (1 Admin, 1 Staff, 5 Gamers)</span>
-          </div>
-          <h2 className="font-display text-lg font-bold text-stone-900">
-            One-Click Role & Scenario Login
-          </h2>
-          <p className="text-xs text-stone-600">
-            Click any seeded user below to populate credentials or switch straight into their session.
-          </p>
-
-          <div className="space-y-2.5">
-            {demoAccounts.map((acc) => (
-              <div
-                key={acc.id}
-                className="p-3.5 rounded-2xl border border-stone-200/80 hover:border-orange-300 transition-all flex items-center justify-between gap-3"
-              >
-                <div>
-                  <div className="flex items-center gap-2 text-xs">
-                    <span className="font-bold text-orange-700">{acc.role}</span>
-                    <span className="text-stone-400">·</span>
-                    <span className="font-semibold text-stone-900">{acc.name}</span>
-                  </div>
-                  <p className="text-xs font-mono text-stone-500 mt-0.5">{acc.email}</p>
-                  {acc.planName && (
-                    <p className="text-[11px] text-stone-500 mt-0.5">
-                      {acc.planName} ({acc.subStatus})
-                      {acc.parentalGateOn ? ' · PIN: 4210' : ''}
-                      {acc.isFrozen ? ' · 48h Trade Lock' : ''}
-                    </p>
-                  )}
-                </div>
-
-                <button
-                  type="button"
-                  onClick={async () => {
-                    const user = await quickSwitchAccount(acc.id);
-                    if (user) {
-                      navigate(user.role === 'GAMER' ? '/gamer' : '/admin');
-                    }
-                  }}
-                  className="px-3 py-1.5 bg-orange-50 hover:bg-orange-100 text-orange-700 font-semibold text-xs rounded-xl whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  Login As {acc.role}
-                </button>
-              </div>
-            ))}
-          </div>
-
-          <div className="p-3.5 bg-stone-50 rounded-2xl text-xs text-stone-600 space-y-1">
-            <div className="flex items-center gap-1.5 font-semibold text-stone-800">
-              <Lock className="w-3.5 h-3.5 text-orange-600" />
-              <span>Standard Seed Passwords:</span>
-            </div>
-            <p className="font-mono">Admin: BrightloopAdmin!2026</p>
-            <p className="font-mono">Staff: BrightloopStaff!2026</p>
-            <p className="font-mono">Gamers: GamerPass!123</p>
-          </div>
-        </div>
+    <section className="flex items-center justify-center px-5 py-9 sm:px-9 lg:px-12 lg:py-12"><div className="w-full max-w-[460px]"><Link to="/" className="mb-6 inline-flex items-center gap-1.5 text-xs font-semibold text-[#8c887e] transition hover:text-[#e98415]"><ArrowLeft size={14}/> Back to Brightloop</Link><div className="rounded-[26px] border border-[#f0eee8] bg-white p-6 sm:p-8"><div className="mb-6"><p className="text-xs font-bold uppercase tracking-[.16em] text-[#e98415]">{isReset?'ACCOUNT RECOVERY':mode==='login'?'PLAYER PORTAL':'JOIN THE LOOP'}</p><h2 className="mt-2 text-2xl font-extrabold tracking-tight text-[#292722] sm:text-[30px]">{isReset?'Reset your password':mode==='login'?'Welcome back':'Create your account'}</h2><p className="mt-2 text-sm leading-5 text-[#88857b]">{isReset?'Enter your account email and we’ll guide you through the reset process.':mode==='login'?'Sign in to manage memberships, rewards and more.':'Create a Brightloop account and find your next favorite game.'}</p></div>
+      <form onSubmit={submit} noValidate className="space-y-4">{mode==='register'&&<div><label htmlFor="player-name" className="mb-1.5 block text-xs font-semibold text-[#4f4d46]">Player name</label><div className="relative"><UserRound size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[#aaa69b]"/><input id="player-name" value={name} onChange={e=>setName(e.target.value)} autoComplete="name" placeholder="How should we call you?" className="h-12 w-full rounded-xl border border-[#e9e6de] bg-[#fdfcf9] pl-10 pr-3 text-sm outline-none transition focus:border-[#ffb35c] focus:ring-4 focus:ring-[#ffb35c]/15"/></div></div>}
+      <div><label htmlFor="email" className="mb-1.5 block text-xs font-semibold text-[#4f4d46]">Email address</label><div className="relative"><Mail size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[#aaa69b]"/><input id="email" type="email" value={email} onChange={e=>setEmail(e.target.value)} autoComplete="email" placeholder="you@example.com" className="h-12 w-full rounded-xl border border-[#e9e6de] bg-[#fdfcf9] pl-10 pr-3 text-sm outline-none transition focus:border-[#ffb35c] focus:ring-4 focus:ring-[#ffb35c]/15"/></div></div>
+      {!isReset&&<div><label htmlFor="password" className="mb-1.5 block text-xs font-semibold text-[#4f4d46]">Password</label><div className="relative"><LockKeyhole size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[#aaa69b]"/><input id="password" type={showPassword?'text':'password'} value={password} onChange={e=>setPassword(e.target.value)} autoComplete={mode==='login'?'current-password':'new-password'} placeholder="Enter your password" className="h-12 w-full rounded-xl border border-[#e9e6de] bg-[#fdfcf9] pl-10 pr-12 text-sm outline-none transition focus:border-[#ffb35c] focus:ring-4 focus:ring-[#ffb35c]/15"/><button type="button" onClick={()=>setShowPassword(!showPassword)} aria-label={showPassword?'Hide password':'Show password'} className="absolute right-3 top-1/2 -translate-y-1/2 rounded-lg p-1.5 text-[#99958a] hover:bg-[#f5f3ee]">{showPassword?<EyeOff size={17}/>:<Eye size={17}/>}</button></div></div>}
+      {mode==='login'&&<div className="flex items-center justify-between gap-3"><label className="inline-flex cursor-pointer items-center gap-2 text-xs text-[#716e65]"><input type="checkbox" checked={remember} onChange={e=>setRemember(e.target.checked)} className="h-4 w-4 accent-[#ff941f]"/>Remember me</label><button type="button" onClick={()=>setPageMode('reset')} className="text-xs font-semibold text-[#e98415] hover:text-[#bb650a]">Forgot password?</button></div>}
+      {error&&<p role="alert" className="rounded-xl border border-[#f2c7c0] bg-[#fff4f1] px-3.5 py-3 text-xs font-medium leading-5 text-[#a43f32]">{error}</p>}{notice&&<p role="status" className="rounded-xl border border-[#f4dfb5] bg-[#fff9ec] px-3.5 py-3 text-xs font-medium leading-5 text-[#80540e]">{notice}</p>}
+      <button type="submit" disabled={loading} className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-[#ff941f] to-[#ffb72a] text-sm font-bold text-white shadow-[0_6px_14px_#ff941f38] transition hover:brightness-105 disabled:cursor-wait disabled:opacity-60">{loading?'Please wait…':isReset?'Send reset instructions':mode==='login'?'Sign In':'Create Account'}<ArrowRight size={16}/></button></form>
+      {isReset?<button type="button" onClick={()=>setPageMode('login')} className="mt-4 w-full text-center text-xs font-semibold text-[#77746b] hover:text-[#e98415]">Back to sign in</button>:<><div className="my-5 flex items-center gap-3"><span className="h-px flex-1 bg-[#eeece5]"/><span className="text-[10px] font-semibold uppercase tracking-wider text-[#aaa69b]">or continue with</span><span className="h-px flex-1 bg-[#eeece5]"/></div><button type="button" onClick={()=>setNotice('Google sign-in is not connected in this demo yet. Sign in with your email and password instead.')} className="flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-[#e9e6de] bg-white text-sm font-semibold text-[#4e4b44] transition hover:bg-[#faf9f6]"><span className="font-bold text-base text-[#4285f4]">G</span> Continue with Google</button><p className="mt-5 text-center text-xs text-[#858178]">{mode==='login'?"New to Brightloop?":"Already have an account?"} <button type="button" onClick={()=>setPageMode(mode==='login'?'register':'login')} className="font-bold text-[#e98415] hover:underline">{mode==='login'?'Create Account':'Sign In'}</button></p></>}
       </div>
-    </div>
-  );
+      {mode==='login'&&demoAccounts.length>0&&<details className="group mt-4 rounded-2xl border border-[#ebe8e0] bg-white px-4 py-3"><summary className="flex cursor-pointer list-none items-center justify-between gap-2 text-xs font-semibold text-[#716e65]">Demo access <span className="text-[#a09c91]">Admin, staff & player accounts</span><ArrowRight size={14} className="text-[#e98415] transition group-open:rotate-90"/></summary><div className="mt-3 space-y-2">{demoAccounts.map(acc=><button key={acc.id} type="button" disabled={loading} onClick={()=>demoLogin(acc.id)} className="flex w-full items-center justify-between rounded-xl border border-[#f0eee8] px-3 py-2.5 text-left transition hover:border-[#ffbd70] hover:bg-[#fffaf2] disabled:opacity-50"><span><span className="block text-xs font-semibold text-[#39372f]">{acc.name}</span><span className="text-[10px] text-[#99958a]">{acc.email}</span></span><span className="rounded-full bg-[#fff0dc] px-2 py-1 text-[9px] font-bold text-[#d77a11]">{acc.role}</span></button>)}</div></details>}
+      <p className="mt-5 flex items-center justify-center gap-1.5 text-[10px] text-[#a09c91]"><ShieldCheck size={13}/> Your Brightloop account is protected.</p></div></section>
+  </div></main>;
 }

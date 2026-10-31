@@ -17,9 +17,10 @@ function AppRoutes() {
   const { pathname } = useLocation();
   const workspace = pathname.startsWith('/admin/') || pathname.startsWith('/customer/');
   const landing = pathname === '/';
+  const authPage = pathname === '/login' || pathname === '/register';
   return (
     <div className="min-h-screen flex flex-col bg-[#F5F4F0] text-stone-900">
-      {!workspace && !landing && <><Navbar /><RoleSwitcherBanner /></>}
+      {!workspace && !landing && !authPage && <><Navbar /><RoleSwitcherBanner /></>}
       <main className="flex-1">
             <Routes>
               <Route path="/" element={<PublicHome />} />
