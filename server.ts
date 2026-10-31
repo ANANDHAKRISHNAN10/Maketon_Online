@@ -1292,6 +1292,60 @@ app.get('/api/intelligence/churn-prediction', requireAuth(['ADMIN', 'STAFF']), (
   res.json({ ...predictions, predictionMode: 'RULE_BASED_SIMULATED', modelConnected: false, generatedAt: new Date().toISOString(), weights: { failedPayments: 20, renewalHistory: 15, expiry: 15, repeatedCancellations: 15, pauseFrequency: 15, usageReduction: 10, paymentDelays: 10 } });
 });
 
+app.get('/api/intelligence/revenue-forecast', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth() - 11, 1);
+  const months = Array.from({ length: 12 }, (_, index) => new Date(start.getFullYear(), start.getMonth() + index, 1));
+  const keyOf = (date: Date) => `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}`;
+  const historyMap = new Map(months.map(month => [keyOf(month), 0]));
+  const historicalPayments = db.prepare(`SELECT amount, status, createdAt FROM Payment WHERE status IN ('SUCCESS','REFUNDED') AND createdAt >= ? ORDER BY createdAt`).all(start.toISOString()) as any[];
+  historicalPayments.forEach(payment => { const key = keyOf(new Date(payment.createdAt)); if (historyMap.has(key)) historyMap.set(key, (historyMap.get(key)||0) + Number(payment.amount||0)); });
+  const historicalRevenue = months.map(month => ({ month: month.toLocaleString('en-US',{month:'short',year:'2-digit'}), monthKey: keyOf(month), actualCents: historyMap.get(keyOf(month))||0 }));
+  const active = db.prepare(`SELECT s.id as subscriptionId, s.userId, s.planId, s.currentPeriodEnd, s.retentionPromoCode, p.name as planName, p.price, p.billingPeriod FROM Subscription s JOIN Plan p ON p.id = s.planId WHERE s.status = 'ACTIVE'`).all() as any[];
+  const churn = calculateChurnPredictions().subscribers;
+  const riskBySub = new Map(churn.map((record:any) => [record.subscriptionId, record.riskScore]));
+  const mrrOf = (price:number, period:string) => period==='DAILY'?price*30:period==='WEEKLY'?price*4:period==='QUARTERLY'?Math.round(price/3):period==='YEARLY'?Math.round(price/12):price;
+  const currentMrrCents = active.reduce((sum, sub) => sum + mrrOf(sub.price,sub.billingPeriod),0);
+  const payments12m = db.prepare(`SELECT status FROM Payment WHERE createdAt >= ? AND status IN ('SUCCESS','FAILED')`).all(start.toISOString()) as any[];
+  const successCount = payments12m.filter(p=>p.status==='SUCCESS').length;
+  const failedCount = payments12m.filter(p=>p.status==='FAILED').length;
+  const paymentSuccessRate = successCount+failedCount ? successCount/(successCount+failedCount) : 0.95;
+  const retentionDiscount = db.prepare(`SELECT value,type FROM Discount WHERE code = 'RETENTION15' AND isActive = 1`).get() as any;
+  const events:any[]=[];
+  const horizonEnd = new Date(now.getFullYear()+1,now.getMonth()+1,1);
+  const taxRate = Number(process.env.GST_TAX_RATE_PERCENT || 18);
+  const intervalDays:Record<string,number>={DAILY:1,WEEKLY:7,MONTHLY:30,QUARTERLY:90,YEARLY:365};
+  for (const sub of active) {
+    let due = new Date(sub.currentPeriodEnd);
+    if (!Number.isFinite(due.getTime())) continue;
+    const step = (intervalDays[sub.billingPeriod]||30)*86400000;
+    let skipped=0;
+    while(due<now && skipped<48){due=new Date(due.getTime()+step);skipped++;}
+    const discount = sub.retentionPromoCode==='RETENTION15' && retentionDiscount ? (retentionDiscount.type==='PERCENT'?Math.round(sub.price*Number(retentionDiscount.value)/100):Math.min(sub.price,Number(retentionDiscount.value))) : 0;
+    const subtotal = Math.max(0,sub.price-discount); const invoiceValue=subtotal+Math.round(subtotal*taxRate/100);
+    let cycle=0;
+    while(due<horizonEnd && cycle<14){
+      if(due>=now){events.push({subscriptionId:sub.subscriptionId,userId:sub.userId,planName:sub.planName,billingPeriod:sub.billingPeriod,dueAt:due.toISOString(),monthKey:keyOf(due),amountCents:invoiceValue,discountCents:discount,riskScore:Number(riskBySub.get(sub.subscriptionId)||35)});}
+      due=new Date(due.getTime()+step);cycle++;
+    }
+  }
+  const renewalValue30dCents=events.filter(event=>new Date(event.dueAt).getTime()<=now.getTime()+30*86400000).reduce((sum,event)=>sum+event.amountCents,0);
+  const cancelHistory = db.prepare(`SELECT createdAt, COUNT(*) as count FROM AuditLog WHERE action = 'CANCEL_SUBSCRIPTION' AND createdAt >= ? GROUP BY substr(createdAt,1,7)`).all(start.toISOString()) as any[];
+  const cancelMap=new Map(cancelHistory.map(row=>[String(row.createdAt).slice(0,7),Number(row.count)]));
+  const cancellationHistory=historicalRevenue.map(month=>({month:month.month,monthKey:month.monthKey,cancellations:cancelMap.get(month.monthKey)||0}));
+  const last3=historicalRevenue.slice(-3).reduce((sum,row)=>sum+row.actualCents,0)/3;
+  const prior3=historicalRevenue.slice(-6,-3).reduce((sum,row)=>sum+row.actualCents,0)/3;
+  const historicalTrend=prior3>0?Math.max(-0.08,Math.min(0.08,(last3-prior3)/prior3*0.25)):0;
+  const discountUsage=db.prepare(`SELECT COUNT(*) as count, COALESCE(SUM(discountAmount),0) as amount FROM Invoice WHERE createdAt >= ? AND discountAmount > 0`).get(start.toISOString()) as any;
+  const upcomingRenewals=events.sort((a,b)=>a.dueAt.localeCompare(b.dueAt)).slice(0,40);
+  res.json({ currentMrrCents, annualRecurringRevenueCents:currentMrrCents*12, activeSubscriptionCount:active.length,
+    historicalRevenue, renewalEvents:events, upcomingRenewals, renewalValue30dCents, cancellationHistory,
+    paymentSuccessRate, paymentSuccessCount:successCount, paymentFailureCount:failedCount,
+    historicalTrend, retentionDiscountUsage:{count:Number(discountUsage.count),amountCents:Number(discountUsage.amount)},
+    predictedLostRevenueCents:events.filter(event=>event.monthKey===keyOf(new Date(now.getFullYear(),now.getMonth()+1,1))).reduce((sum,event)=>sum+Math.round(event.amountCents*event.riskScore/100),0),
+    generatedAt:now.toISOString(), modelConnected:false, predictionMode:'RULE_BASED_SIMULATED', taxRatePercent:taxRate });
+});
+
 app.post('/api/intelligence/apply-retention', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
   const sessionUser = (req as any).user as SessionUser;
   const { subscriptionId } = req.body;
