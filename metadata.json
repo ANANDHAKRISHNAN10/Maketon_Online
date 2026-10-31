@@ -1,0 +1,6 @@
+{
+  "name": "Brightloop Gaming",
+  "description": "Full-stack gaming subscription management, billing intelligence, gamer self-service battlepass portal, and security platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
