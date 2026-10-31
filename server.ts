@@ -558,6 +558,11 @@ app.post('/api/subscriptions/:id/cancel', requireAuth(), (req, res) => {
     UPDATE Subscription SET status = 'CLOSED', perksFrozen = 1 WHERE id = ?
   `).run(sub.id);
 
+  if (sub.status !== 'CLOSED') {
+    db.prepare(`INSERT INTO AuditLog (id, actorId, action, entityType, entityId, metadata, createdAt) VALUES (?, ?, 'CANCEL_SUBSCRIPTION', 'Subscription', ?, ?, ?)`)
+      .run(`aud_${crypto.randomBytes(4).toString('hex')}`, sessionUser.id, sub.id, JSON.stringify({ previousStatus: sub.status }), new Date().toISOString());
+  }
+
   res.json({ message: 'Subscription has been closed.', status: 'CLOSED' });
 });
 
@@ -1242,7 +1247,7 @@ app.post('/api/intelligence/auto-reconcile', requireAuth(['ADMIN', 'STAFF']), (r
 
 app.get('/api/intelligence/churn-prediction', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
   const predictions = calculateChurnPredictions();
-  res.json(predictions);
+  res.json({ ...predictions, predictionMode: 'RULE_BASED_SIMULATED', modelConnected: false, generatedAt: new Date().toISOString(), weights: { failedPayments: 20, renewalHistory: 15, expiry: 15, repeatedCancellations: 15, pauseFrequency: 15, usageReduction: 10, paymentDelays: 10 } });
 });
 
 app.post('/api/intelligence/apply-retention', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
@@ -1274,6 +1279,21 @@ app.post('/api/intelligence/apply-retention', requireAuth(['ADMIN', 'STAFF']), (
     subscriptionId,
     promoCode: 'RETENTION15',
   });
+});
+
+app.post('/api/intelligence/retention-action', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
+  const sessionUser = (req as any).user as SessionUser;
+  const { subscriptionId, action, points = 500 } = req.body || {};
+  const allowed = ['REMINDER', 'LOYALTY_POINTS', 'PAUSE_SUGGESTION', 'CONTACT'];
+  if (!subscriptionId || !allowed.includes(String(action))) return res.status(400).json({ error: 'Choose a valid customer retention action.' });
+  const subscription = db.prepare(`SELECT s.id, s.userId, u.name, u.email FROM Subscription s JOIN User u ON u.id = s.userId WHERE s.id = ?`).get(subscriptionId) as any;
+  if (!subscription) return res.status(404).json({ error: 'Subscription not found.' });
+  const safePoints = Math.max(100, Math.min(5000, Math.round(Number(points) || 500)));
+  const descriptions: Record<string,string> = { REMINDER: 'Renewal reminder queued in the demo workflow.', LOYALTY_POINTS: `${safePoints} loyalty points offer recorded for review.`, PAUSE_SUGGESTION: 'Flexible pause suggestion recorded for the next customer conversation.', CONTACT: 'Customer contact follow-up recorded for the retention team.' };
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO AuditLog (id, actorId, action, entityType, entityId, metadata, createdAt) VALUES (?, ?, ?, 'Subscription', ?, ?, ?)`)
+    .run(`aud_${crypto.randomBytes(4).toString('hex')}`, sessionUser.id, `RETENTION_${action}`, subscriptionId, JSON.stringify({ customerId: subscription.userId, customerEmail: subscription.email, points: action === 'LOYALTY_POINTS' ? safePoints : undefined, mode: 'DEMO_ACTION_LOGGED' }), now);
+  res.json({ message: descriptions[action], customerName: subscription.name, action, demoAction: true });
 });
 
 app.get('/api/intelligence/executive-report', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {

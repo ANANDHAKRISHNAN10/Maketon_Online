@@ -872,13 +872,14 @@ export function autoReconcileAllLeakage(actorId: string) {
 export function calculateChurnPredictions() {
   const now = new Date();
   const rows = db.prepare(`
-    SELECT s.id as subscriptionId, s.status, s.currentPeriodEnd, s.retentionPromoCode,
+    SELECT s.id as subscriptionId, s.status, s.currentPeriodStart, s.currentPeriodEnd, s.retentionPromoCode,
            u.id as userId, u.name as userName, u.email as userEmail, u.createdAt as userCreatedAt,
-           p.name as planName, p.price as planPrice
+           p.name as planName, p.price as planPrice, p.billingPeriod
     FROM Subscription s
     JOIN User u ON u.id = s.userId
     JOIN Plan p ON p.id = s.planId
     WHERE u.role = 'GAMER'
+      AND s.id = (SELECT s2.id FROM Subscription s2 WHERE s2.userId = u.id ORDER BY s2.createdAt DESC LIMIT 1)
   `).all() as any[];
 
   const subscribers = rows.map((row) => {
@@ -890,23 +891,38 @@ export function calculateChurnPredictions() {
       SELECT COUNT(*) as cnt FROM PauseHistory WHERE subscriptionId = ?
     `).get(row.subscriptionId) as { cnt: number };
 
+    const renewalHistory = db.prepare(`SELECT COUNT(*) as invoiceCount, SUM(CASE WHEN status = 'PAID' THEN 1 ELSE 0 END) as paidCount FROM Invoice WHERE subscriptionId = ?`).get(row.subscriptionId) as any;
+    const delayedPayments = db.prepare(`SELECT COUNT(*) as cnt FROM Payment p JOIN Invoice i ON i.id = p.invoiceId WHERE p.userId = ? AND p.status = 'SUCCESS' AND p.createdAt > i.dueDate`).get(row.userId) as any;
+    const cancellationHistory = db.prepare(`SELECT COUNT(*) as cnt FROM AuditLog WHERE entityType = 'Subscription' AND entityId = ? AND action = 'CANCEL_SUBSCRIPTION'`).get(row.subscriptionId) as any;
+    const loginUsage = db.prepare(`SELECT SUM(CASE WHEN createdAt >= ? THEN 1 ELSE 0 END) as recentCount, SUM(CASE WHEN createdAt >= ? AND createdAt < ? THEN 1 ELSE 0 END) as priorCount FROM LoginActivity WHERE userId = ?`).get(new Date(now.getTime()-30*86400000).toISOString(), new Date(now.getTime()-60*86400000).toISOString(), new Date(now.getTime()-30*86400000).toISOString(), row.userId) as any;
+    const usageReductionPercent = Number(loginUsage?.priorCount || 0) > 0 ? Math.max(0, Math.round((Number(loginUsage.priorCount)-Number(loginUsage.recentCount||0))/Number(loginUsage.priorCount)*100)) : null;
+    const history = db.prepare(`SELECT id, status, currentPeriodStart, currentPeriodEnd, createdAt FROM Subscription WHERE userId = ? ORDER BY createdAt DESC`).all(row.userId);
+    const invoices = db.prepare(`SELECT invoiceNumber, status, amountSubtotal, totalAmount, dueDate, createdAt FROM Invoice WHERE subscriptionId = ? ORDER BY createdAt DESC`).all(row.subscriptionId);
+    const payments = db.prepare(`SELECT p.id, p.amount, p.method, p.status, p.referenceCode, p.createdAt, i.invoiceNumber, i.dueDate FROM Payment p LEFT JOIN Invoice i ON i.id = p.invoiceId WHERE p.userId = ? ORDER BY p.createdAt DESC LIMIT 12`).all(row.userId);
+    const pauses = db.prepare(`SELECT pauseStart, plannedResume, actualResume, daysPaused, reason FROM PauseHistory WHERE subscriptionId = ? ORDER BY createdAt DESC`).all(row.subscriptionId);
+    const lastLogin = db.prepare(`SELECT MAX(createdAt) as lastActivityAt FROM LoginActivity WHERE userId = ?`).get(row.userId) as any;
+
     const failedPayments = failedCountObj.cnt;
     const pauseFrequency = pauseCountObj.cnt;
+    const paidRenewals = Number(renewalHistory?.paidCount || 0);
+    const paymentDelays = Number(delayedPayments?.cnt || 0);
+    const repeatedCancellations = Number(cancellationHistory?.cnt || 0);
     const daysToExpiry = Math.max(0, Math.round((new Date(row.currentPeriodEnd).getTime() - now.getTime()) / 86400000));
-    const tenureDays = Math.max(1, Math.round((now.getTime() - new Date(row.userCreatedAt).getTime()) / 86400000));
 
     // Normalized sub-scores (0-100 each)
     const failedScore = Math.min(100, failedPayments * 50); // 2+ failed payments = 100
     const pauseScore = Math.min(100, pauseFrequency * 45);  // 2+ pauses = 90-100
     const expiryScore = daysToExpiry <= 5 ? 100 : daysToExpiry <= 15 ? 65 : daysToExpiry <= 30 ? 35 : 10;
-    const tenureScore = tenureDays < 30 ? 90 : tenureDays < 90 ? 60 : tenureDays < 180 ? 30 : 10;
+    const renewalScore = paidRenewals === 0 ? 70 : paidRenewals === 1 ? 45 : paidRenewals < 4 ? 25 : 10;
+    const cancellationScore = Math.min(100, repeatedCancellations * 50);
+    const usageScore = usageReductionPercent === null ? 20 : usageReductionPercent >= 70 ? 100 : usageReductionPercent >= 45 ? 70 : usageReductionPercent >= 20 ? 45 : 10;
+    const delayScore = Math.min(100, paymentDelays * 45);
 
-    // Exact weighted calculation: 30% + 25% + 20% + 25% = 100%
+    // Transparent prototype weights: failures 20%, renewal history 15%, expiry 15%,
+    // cancellations 15%, pauses 15%, usage reduction 10%, payment delays 10%.
     const riskScore = Math.round(
-      failedScore * 0.30 +
-      pauseScore * 0.25 +
-      expiryScore * 0.20 +
-      tenureScore * 0.25
+      failedScore * 0.20 + renewalScore * 0.15 + expiryScore * 0.15 + cancellationScore * 0.15 +
+      pauseScore * 0.15 + usageScore * 0.10 + delayScore * 0.10
     );
 
     const riskTier: 'HIGH' | 'MEDIUM' | 'LOW' =
@@ -914,10 +930,27 @@ export function calculateChurnPredictions() {
 
     const suggestedAction =
       riskTier === 'HIGH'
-        ? 'Trigger 15% Loyalty Retention Promo (RETENTION15) & retry smart dunning'
+        ? failedPayments || paymentDelays ? 'Send a renewal reminder and review payment support; consider a capped retention offer.' : 'Contact the player and offer a tailored retention benefit.'
         : riskTier === 'MEDIUM'
-        ? 'Send Battlepass milestone reminder + offer 15% renewal lock-in'
-        : 'Healthy engagement — eligible for Annual Legend Pass upgrade offer';
+        ? pauseFrequency ? 'Offer a flexible pause and check in before renewal.' : 'Send a friendly renewal reminder with a loyalty reward.'
+        : 'Low churn signals; continue regular loyalty engagement.';
+
+    const reasons = [
+      failedPayments > 0 ? `${failedPayments} failed payment${failedPayments===1?'':'s'}` : '',
+      paymentDelays > 0 ? `${paymentDelays} late payment${paymentDelays===1?'':'s'}` : '',
+      repeatedCancellations > 0 ? `${repeatedCancellations} prior cancellation${repeatedCancellations===1?'':'s'}` : '',
+      pauseFrequency > 0 ? `${pauseFrequency} pause${pauseFrequency===1?'':'s'}` : '',
+      usageReductionPercent !== null && usageReductionPercent >= 20 ? `usage down ${usageReductionPercent}%` : '',
+      daysToExpiry <= 30 ? `renewal in ${daysToExpiry} days` : '',
+      paidRenewals === 0 ? 'limited renewal history' : '',
+    ].filter(Boolean);
+    const usageTrend = Array.from({length:6}, (_, index) => {
+      const month = new Date(now.getFullYear(), now.getMonth() - (5-index), 1);
+      const next = new Date(month.getFullYear(), month.getMonth()+1, 1);
+      const entry = db.prepare(`SELECT COUNT(*) as count FROM LoginActivity WHERE userId = ? AND createdAt >= ? AND createdAt < ?`).get(row.userId, month.toISOString(), next.toISOString()) as any;
+      return { month: month.toLocaleString('en-US',{month:'short'}), sessions: Number(entry.count||0) };
+    });
+    const userLastActivity = db.prepare(`SELECT MAX(createdAt) as at FROM Payment WHERE userId = ?`).get(row.userId) as any;
 
     return {
       subscriptionId: row.subscriptionId,
@@ -926,20 +959,38 @@ export function calculateChurnPredictions() {
       userEmail: row.userEmail,
       planName: row.planName,
       planPriceCents: row.planPrice,
+      billingPeriod: row.billingPeriod,
+      status: row.status,
+      currentPeriodStart: row.currentPeriodStart,
+      currentPeriodEnd: row.currentPeriodEnd,
+      lastActivityAt: lastLogin?.lastActivityAt || userLastActivity?.at || row.userCreatedAt,
       riskScore,
       riskTier,
       retentionPromoApplied: row.retentionPromoCode === 'RETENTION15',
       factors: {
         failedPayments,
-        failedPaymentWeightScore: Math.round(failedScore * 0.30),
+        failedPaymentWeightScore: Math.round(failedScore * 0.20),
+        paidRenewals,
+        renewalHistoryWeightScore: Math.round(renewalScore * 0.15),
         pauseFrequency,
-        pauseWeightScore: Math.round(pauseScore * 0.25),
+        pauseWeightScore: Math.round(pauseScore * 0.15),
         daysToExpiry,
-        expiryWeightScore: Math.round(expiryScore * 0.20),
-        tenureDays,
-        tenureWeightScore: Math.round(tenureScore * 0.25),
+        expiryWeightScore: Math.round(expiryScore * 0.15),
+        repeatedCancellations,
+        cancellationWeightScore: Math.round(cancellationScore * 0.15),
+        usageReductionPercent,
+        usageWeightScore: Math.round(usageScore * 0.10),
+        paymentDelays,
+        paymentDelayWeightScore: Math.round(delayScore * 0.10),
       },
+      mainRiskReason: reasons[0] || (riskTier === 'LOW' ? 'No significant risk signals observed' : 'Combined account activity signals'),
+      reasons,
       suggestedAction,
+      subscriptions: history,
+      invoices,
+      payments,
+      pauses,
+      usageTrend,
     };
   });
 
