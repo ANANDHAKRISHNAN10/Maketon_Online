@@ -742,7 +742,7 @@ app.get('/api/admin/overview', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
 
   const users = db.prepare(`
     SELECT u.id, u.name, u.email, u.role, u.parentEmail, u.parentalGateOn, u.lastLoginIp, u.lastLoginCountry, u.isFrozen, u.tradeLockUntil, u.createdAt,
-           s.id as subscriptionId, s.status as subscriptionStatus, s.currentPeriodEnd, s.perksFrozen,
+           s.id as subscriptionId, s.status as subscriptionStatus, s.currentPeriodEnd, s.createdAt as subscriptionCreatedAt, s.perksFrozen,
            p.name as planName, p.price as planPrice
     FROM User u
     LEFT JOIN Subscription s ON s.userId = u.id
