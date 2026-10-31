@@ -936,6 +936,67 @@ app.put('/api/admin/disputes/:id', requireAuth(['ADMIN', 'STAFF']), (req, res) =
   res.json({ message: 'Dispute status updated.', status });
 });
 
+// --- ADMIN BILLING & PAYMENT MANAGEMENT ---
+app.get('/api/admin/billing', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
+  const invoices = db.prepare(`SELECT i.*, u.name as customerName, u.email as customerEmail,
+    s.planId, p.name as planName, p.billingPeriod
+    FROM Invoice i JOIN User u ON u.id = i.userId
+    LEFT JOIN Subscription s ON s.id = i.subscriptionId LEFT JOIN Plan p ON p.id = s.planId
+    ORDER BY i.createdAt DESC`).all().map((invoice: any) => ({
+      ...invoice,
+      lastSentAt: (db.prepare(`SELECT createdAt FROM AuditLog WHERE entityType = 'Invoice' AND entityId = ? AND action = 'SEND_INVOICE' ORDER BY createdAt DESC LIMIT 1`).get(invoice.id) as any)?.createdAt || null,
+    }));
+  const payments = db.prepare(`SELECT p.*, u.name as customerName, u.email as customerEmail, i.invoiceNumber
+    FROM Payment p JOIN User u ON u.id = p.userId LEFT JOIN Invoice i ON i.id = p.invoiceId
+    ORDER BY p.createdAt DESC`).all();
+  const subscriptions = db.prepare(`SELECT s.*, u.name as customerName, u.email as customerEmail,
+    p.name as planName, p.billingPeriod, p.price as planPrice
+    FROM Subscription s JOIN User u ON u.id = s.userId JOIN Plan p ON p.id = s.planId
+    WHERE s.status = 'ACTIVE' ORDER BY s.currentPeriodEnd ASC`).all();
+  res.json({ invoices, payments, subscriptions });
+});
+
+app.post('/api/admin/invoices/:id/send', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
+  const invoice = db.prepare(`SELECT i.*, u.email as customerEmail FROM Invoice i JOIN User u ON u.id = i.userId WHERE i.id = ?`).get(req.params.id) as any;
+  if (!invoice) return res.status(404).json({ error: 'Invoice not found.' });
+  const actor = (req as any).user as SessionUser;const now = new Date().toISOString();
+  db.prepare(`INSERT INTO AuditLog (id, actorId, action, entityType, entityId, metadata, createdAt) VALUES (?, ?, 'SEND_INVOICE', 'Invoice', ?, ?, ?)`)
+    .run(`aud_${crypto.randomBytes(5).toString('hex')}`, actor.id, invoice.id, JSON.stringify({ recipient: invoice.customerEmail, delivery: 'DEMO_DELIVERY_LOGGED' }), now);
+  res.json({ message: `Invoice delivery recorded for ${invoice.customerEmail}.`, recipient: invoice.customerEmail, sentAt: now, deliveryMode: 'DEMO' });
+});
+
+app.post('/api/admin/payments/:id/refund', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
+  const payment = db.prepare('SELECT * FROM Payment WHERE id = ?').get(req.params.id) as any;
+  if (!payment) return res.status(404).json({ error: 'Payment not found.' });
+  if (payment.status !== 'SUCCESS') return res.status(400).json({ error: 'Only successful payments can be refunded.' });
+  const amount = req.body?.amountCents === undefined ? payment.amount : Number(req.body.amountCents);
+  if (!Number.isInteger(amount) || amount <= 0) return res.status(400).json({ error: 'Enter a valid refund amount.' });
+  const prior = db.prepare(`SELECT COALESCE(SUM(ABS(amount)), 0) as refunded FROM Payment WHERE referenceCode LIKE ? AND status = 'REFUNDED'`).get(`RF-${payment.referenceCode}-%`) as any;
+  if (amount + Number(prior.refunded) > payment.amount) return res.status(400).json({ error: 'Refund amount exceeds the remaining captured payment.' });
+  const now = new Date().toISOString();const refundId = `pay_${crypto.randomBytes(5).toString('hex')}`;
+  const referenceCode = `RF-${payment.referenceCode}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+  db.prepare(`INSERT INTO Payment (id, invoiceId, userId, amount, method, status, referenceCode, ipAddress, createdAt)
+    VALUES (?, ?, ?, ?, 'REFUND', 'REFUNDED', ?, ?, ?)`)
+    .run(refundId, payment.invoiceId, payment.userId, -amount, referenceCode, payment.ipAddress, now);
+  const actor = (req as any).user as SessionUser;
+  db.prepare(`INSERT INTO AuditLog (id, actorId, action, entityType, entityId, metadata, createdAt) VALUES (?, ?, 'RECORD_REFUND', 'Payment', ?, ?, ?)`)
+    .run(`aud_${crypto.randomBytes(5).toString('hex')}`, actor.id, payment.id, JSON.stringify({ refundId, referenceCode, amountCents: amount }), now);
+  res.status(201).json({ message: 'Refund recorded.', refundId, referenceCode, amountCents: amount });
+});
+
+app.post('/api/admin/payments/:id/link', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
+  const payment = db.prepare('SELECT * FROM Payment WHERE id = ?').get(req.params.id) as any;
+  const invoice = db.prepare('SELECT * FROM Invoice WHERE id = ?').get(String(req.body?.invoiceId || '')) as any;
+  if (!payment) return res.status(404).json({ error: 'Payment not found.' });
+  if (!invoice) return res.status(404).json({ error: 'Invoice not found.' });
+  if (payment.userId !== invoice.userId) return res.status(400).json({ error: 'Payment and invoice must belong to the same customer.' });
+  db.prepare('UPDATE Payment SET invoiceId = ? WHERE id = ?').run(invoice.id, payment.id);
+  const actor = (req as any).user as SessionUser;
+  db.prepare(`INSERT INTO AuditLog (id, actorId, action, entityType, entityId, metadata, createdAt) VALUES (?, ?, 'LINK_PAYMENT_TO_INVOICE', 'Payment', ?, ?, ?)`)
+    .run(`aud_${crypto.randomBytes(5).toString('hex')}`, actor.id, payment.id, JSON.stringify({ invoiceId: invoice.id, invoiceNumber: invoice.invoiceNumber }), new Date().toISOString());
+  res.json({ message: 'Payment linked to invoice.', invoiceNumber: invoice.invoiceNumber });
+});
+
 // Plan CRUD
 app.post('/api/admin/plans', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
   const parsed = PlanInputSchema.safeParse(req.body);
