@@ -45,7 +45,7 @@ export const ParentalSettingsSchema = z.object({
 export const PlanInputSchema = z.object({
   name: z.string().min(2),
   tagline: z.string().min(4),
-  billingPeriod: z.enum(['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY']),
+  billingPeriod: z.enum(['DAILY', 'WEEKLY', 'MONTHLY', 'QUARTERLY', 'YEARLY']),
   price: z.number().int().positive(),
   costPrice: z.number().int().nonnegative(),
   perks: z.array(z.string()).min(1),
@@ -963,6 +963,7 @@ export function buildExecutiveReportMarkdown() {
   const mrrCents = activeSubs.reduce((sum, s) => {
     if (s.billingPeriod === 'DAILY') return sum + s.price * 30;
     if (s.billingPeriod === 'WEEKLY') return sum + s.price * 4;
+    if (s.billingPeriod === 'QUARTERLY') return sum + Math.round(s.price / 3);
     if (s.billingPeriod === 'YEARLY') return sum + Math.round(s.price / 12);
     return sum + s.price;
   }, 0);

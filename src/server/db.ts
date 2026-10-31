@@ -214,6 +214,15 @@ export function seedDatabase(forceReset = false) {
   }
 
   const existingUsers = db.prepare('SELECT COUNT(*) as count FROM User').get() as { count: number };
+  db.prepare(`
+    INSERT OR IGNORE INTO Plan (id, name, tagline, billingPeriod, price, costPrice, perksJson, badge, isRecommended, autoClose, allowPause, maxPauseDays, createdAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    'plan_quarterly_pro', 'Quarterly Pro Pass', 'Three months of Pro gaming, rewards, and flexible play in one simple plan.',
+    'QUARTERLY', 3999, 1180,
+    JSON.stringify(['Access to 180+ Brightloop games', '3,600 monthly gems across the quarter', 'Pause membership for up to 30 days', '15% member discount on add-ons']),
+    'Save 35%', 0, 0, 1, 30, new Date('2026-10-31T08:00:00.000Z').toISOString()
+  );
   if (existingUsers.count > 0 && !forceReset) {
     return;
   }

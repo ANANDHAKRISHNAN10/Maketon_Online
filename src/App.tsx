@@ -35,6 +35,7 @@ function AppRoutes() {
                 <Route path="/customer/subscriptions" element={<FoundationPage />} />
                 <Route path="/customer/loyalty" element={<FoundationPage />} />
                 <Route path="/customer/invoices" element={<FoundationPage />} />
+                <Route path="/customer/payments" element={<FoundationPage />} />
                 <Route path="/customer/security" element={<FoundationPage />} />
                 <Route path="/admin/dashboard" element={<FoundationPage />} />
                 <Route path="/admin/products" element={<FoundationPage />} />
@@ -42,8 +43,13 @@ function AppRoutes() {
                 <Route path="/admin/customers" element={<FoundationPage />} />
                 <Route path="/admin/billing" element={<FoundationPage />} />
                 <Route path="/admin/discounts" element={<FoundationPage />} />
+                <Route path="/admin/pause-cancellation" element={<FoundationPage />} />
+                <Route path="/admin/loyalty" element={<FoundationPage />} />
+                <Route path="/admin/invoices" element={<FoundationPage />} />
+                <Route path="/admin/payments" element={<FoundationPage />} />
                 <Route path="/admin/fraud" element={<FoundationPage />} />
                 <Route path="/admin/churn" element={<FoundationPage />} />
+                <Route path="/admin/revenue-intelligence" element={<FoundationPage />} />
                 <Route path="/admin/revenue-leakage" element={<FoundationPage />} />
                 <Route path="/admin/forecasting" element={<FoundationPage />} />
                 <Route path="/admin/reports" element={<FoundationPage />} />

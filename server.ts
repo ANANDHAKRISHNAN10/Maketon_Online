@@ -423,6 +423,8 @@ app.post('/api/gamer/subscribe', requireAuth(['GAMER', 'ADMIN', 'STAFF']), (req,
       ? 7
       : plan.billingPeriod === 'YEARLY'
       ? 365
+      : plan.billingPeriod === 'QUARTERLY'
+      ? 90
       : 30;
   const periodEnd = new Date(now.getTime() + periodDays * 86400000).toISOString();
 
@@ -685,6 +687,7 @@ app.get('/api/admin/overview', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
   const mrrCents = activeSubs.reduce((sum, s) => {
     if (s.billingPeriod === 'DAILY') return sum + s.price * 30;
     if (s.billingPeriod === 'WEEKLY') return sum + s.price * 4;
+    if (s.billingPeriod === 'QUARTERLY') return sum + Math.round(s.price / 3);
     if (s.billingPeriod === 'YEARLY') return sum + Math.round(s.price / 12);
     return sum + s.price;
   }, 0);
@@ -748,6 +751,20 @@ app.get('/api/admin/overview', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
     perksFrozen: Boolean(u.perksFrozen),
   }));
 
+  const invoices = db.prepare(`
+    SELECT i.*, u.name as customerName, u.email as customerEmail, p.name as planName
+    FROM Invoice i JOIN User u ON u.id = i.userId
+    LEFT JOIN Subscription s ON s.id = i.subscriptionId
+    LEFT JOIN Plan p ON p.id = s.planId
+    ORDER BY i.createdAt DESC LIMIT 100
+  `).all();
+  const payments = db.prepare(`
+    SELECT p.*, u.name as customerName, u.email as customerEmail, i.invoiceNumber
+    FROM Payment p JOIN User u ON u.id = p.userId
+    LEFT JOIN Invoice i ON i.id = p.invoiceId
+    ORDER BY p.createdAt DESC LIMIT 100
+  `).all();
+
   res.json({
     kpis: {
       mrrCents,
@@ -764,6 +781,8 @@ app.get('/api/admin/overview', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
     products,
     discounts,
     users,
+    invoices,
+    payments,
   });
 });
 
