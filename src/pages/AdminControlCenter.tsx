@@ -22,13 +22,13 @@ import {
 import { useAuth } from '../context/AuthContext';
 import { AdminSubnav } from '../components/AdminSubnav';
 
-export function AdminControlCenter() {
+export function AdminControlCenter({ initialSection = 'overview', embedded = false }: { initialSection?: 'overview' | 'configurator' | 'discounts' | 'users'; embedded?: boolean }) {
   const { user, authFetch } = useAuth();
 
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
-  const [activeSection, setActiveSection] = useState<'overview' | 'configurator' | 'discounts' | 'users'>('overview');
+  const [activeSection, setActiveSection] = useState<'overview' | 'configurator' | 'discounts' | 'users'>(initialSection);
 
   // Plan Configurator Form
   const [editingPlanId, setEditingPlanId] = useState<string | null>(null);
@@ -227,7 +227,7 @@ export function AdminControlCenter() {
   };
 
   if (user?.role === 'GAMER') {
-    return <AdminSubnav />;
+    return embedded ? <div className="rounded-2xl bg-white p-8 text-sm text-[#8d897f]">Administrator access is required to manage products and plans.</div> : <AdminSubnav />;
   }
 
   const kpis = data?.kpis;
@@ -268,7 +268,7 @@ export function AdminControlCenter() {
 
   return (
     <div className="min-h-screen bg-[#FFFBF5] pb-20">
-      <AdminSubnav onResetSeed={handleResetSeed} />
+      {!embedded && <AdminSubnav onResetSeed={handleResetSeed} />}
 
       <div className="max-w-7xl mx-auto px-6 mt-8 space-y-8">
         {/* Top Header + Generate Due Invoices CTA */}

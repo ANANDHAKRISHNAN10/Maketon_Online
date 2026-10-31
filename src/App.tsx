@@ -50,7 +50,7 @@ function AppRoutes() {
                 <Route path="/customer/payments" element={<FoundationPage />} />
                 <Route path="/customer/security" element={<FoundationPage />} />
                 <Route path="/admin/dashboard" element={<AdminDashboardPage />} />
-                <Route path="/admin/products" element={<FoundationPage />} />
+                <Route path="/admin/products" element={<AdminControlCenter initialSection="configurator" embedded />} />
                 <Route path="/admin/subscriptions" element={<AdminSubscriptionsPage />} />
                 <Route path="/admin/customers" element={<AdminCustomersPage />} />
                 <Route path="/admin/billing" element={<AdminBillingPage />} />

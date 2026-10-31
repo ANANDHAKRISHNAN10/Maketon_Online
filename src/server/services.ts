@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { z } from 'zod';
-import { db, hashPassword, hashPin } from './db';
+import { db, getTaxRatePercent, hashPassword, hashPin, nextInvoiceNumber } from './db';
 
 // --- Zod Validation Schemas ---
 
@@ -34,6 +34,7 @@ export const SubscribePlanSchema = z.object({
   discountCode: z.string().optional(),
   paymentMethod: z.enum(['CREDIT_CARD', 'UPI', 'WALLET']).default('CREDIT_CARD'),
   parentalPin: z.string().optional(),
+  products: z.array(z.object({ productId: z.string().min(1), quantity: z.number().int().min(1).max(10) })).max(10).default([]),
 });
 
 export const ParentalSettingsSchema = z.object({
@@ -311,12 +312,14 @@ export function pauseSubscription(params: {
     db.prepare(`
       UPDATE Subscription
       SET status = 'PAUSED',
+          currentPeriodEnd = ?,
           pauseStartDate = ?,
           pauseResumeDate = ?,
           pausedDaysPlanned = ?,
           perksFrozen = 1
       WHERE id = ?
     `).run(
+      projectedEndAfterPause.toISOString(),
       now.toISOString(),
       plannedResume.toISOString(),
       params.durationDays,
@@ -401,7 +404,9 @@ export function resumeSubscription(params: {
     const effectivePausedDays = elapsedDays <= 1 && sub.pausedDaysPlanned ? sub.pausedDaysPlanned : elapsedDays;
 
     const oldPeriodEnd = new Date(sub.currentPeriodEnd);
-    const newPeriodEnd = new Date(oldPeriodEnd.getTime() + effectivePausedDays * 86400000);
+    // The planned extension is applied when pausing; resume only restores access and must not add it twice.
+    const plannedDays = Number(sub.pausedDaysPlanned || 0);
+    const newPeriodEnd = new Date(oldPeriodEnd.getTime() + Math.max(0,effectivePausedDays-plannedDays)*86400000);
 
     db.prepare(`
       UPDATE Subscription
@@ -457,7 +462,8 @@ export function generateInvoicesForDueSubscriptions(params?: {
   subscriptionId?: string;
   actorId?: string;
 }) {
-  const gstRate = Number(process.env.GST_TAX_RATE_PERCENT || 18) / 100;
+  const gstRatePercent = getTaxRatePercent();
+  const gstRate = gstRatePercent / 100;
   const now = new Date();
   const periodKey = params?.billingPeriodKey || `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
 
@@ -537,7 +543,7 @@ export function generateInvoicesForDueSubscriptions(params?: {
       const totalAmount = taxableAmount + taxAmount;
 
       const invId = `inv_${crypto.randomBytes(5).toString('hex')}`;
-      const invNumber = `BL-${now.getUTCFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
+      const invNumber = nextInvoiceNumber(now);
       const dueDate = new Date(now.getTime() + 7 * 86400000).toISOString();
 
       db.prepare(`
@@ -576,7 +582,7 @@ export function generateInvoicesForDueSubscriptions(params?: {
 
     return {
       billingPeriodKey: periodKey,
-      gstRatePercent: 18,
+      gstRatePercent,
       generatedCount: createdInvoices.length,
       skippedDuplicateCount: skippedDuplicates.length,
       invoices: createdInvoices,
@@ -783,7 +789,7 @@ export function detectRevenueLeakage(): {
   }
 
   // 6. Tax mismatches are checked against the configured prototype GST rate (18%).
-  const taxRate = Number(process.env.GST_TAX_RATE_PERCENT || 18);
+  const taxRate = getTaxRatePercent();
   const invoices = db.prepare(`SELECT i.id, i.invoiceNumber, i.subscriptionId, i.billingPeriodKey, i.userId, i.amountSubtotal, i.taxAmount, i.discountAmount, i.status, i.dueDate,
       u.name as userName, u.email as userEmail
     FROM Invoice i JOIN User u ON u.id = i.userId WHERE i.status != 'CANCELLED'`).all() as any[];
@@ -805,8 +811,8 @@ export function detectRevenueLeakage(): {
   }, {} as Record<string, number>);
 
   return { issues, totalLeakageCents, potentiallyRecoverableCents: totalLeakageCents, summaryByType, coverageGaps: [
-    { issueType: 'INCORRECT_PRODUCT_QUANTITY', reason: 'The current billing schema has no purchased product line items or quantities to compare against invoices.' },
-    { issueType: 'MISSING_ADD_ON_CHARGE', reason: 'The current billing schema does not associate purchased add-ons with subscriptions or invoice lines.' },
+    { issueType: 'INCORRECT_PRODUCT_QUANTITY', reason: 'Checkout invoice lines record billed quantity and unit price, but the app does not retain an independent cart/order intent to compare against the billed quantity.' },
+    { issueType: 'MISSING_ADD_ON_CHARGE', reason: 'Selected checkout add-ons are recorded on invoice lines. The catalog does not indicate which optional add-ons a customer intended to buy, so an omitted charge cannot be inferred from an active subscription alone.' },
   ] };
 }
 
@@ -831,23 +837,25 @@ export function fixSingleLeakageIssue(issueId: string, actorId: string) {
       `).get(target.entityId) as any;
 
       const subtotal = sub.planPrice;
-      const tax = Math.round(subtotal * 0.18);
+      const taxRate=getTaxRatePercent();
+      const tax = Math.round(subtotal * taxRate / 100);
       const total = subtotal + tax;
       const invId = `inv_reconciled_${crypto.randomBytes(4).toString('hex')}`;
-      const invNum = `BL-${now.getUTCFullYear()}-R${Math.floor(100 + Math.random() * 899)}`;
+      const invNum = nextInvoiceNumber(now);
 
       db.prepare(`
         INSERT INTO Invoice (id, invoiceNumber, subscriptionId, userId, billingPeriodKey, amountSubtotal, taxAmount, discountAmount, discountCode, totalAmount, status, dueDate, createdAt)
         VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, 'CONFIRMED', ?, ?)
       `).run(invId, invNum, sub.id, sub.userId, periodKey, subtotal, tax, total, new Date(now.getTime() + 7 * 86400000).toISOString(), now.toISOString());
 
-      resolutionSummary = `Generated missing invoice ${invNum} for $${(total / 100).toFixed(2)} (incl. 18% GST).`;
+      resolutionSummary = `Generated missing invoice ${invNum} for $${(total / 100).toFixed(2)} (incl. ${taxRate}% tax).`;
     } else if (target.issueType === 'DUPLICATE_PERIOD_INVOICE') {
       db.prepare(`UPDATE Invoice SET status = 'CANCELLED' WHERE id = ?`).run(target.entityId);
       resolutionSummary = `Cancelled duplicate invoice ${target.entityId}.`;
     } else if (target.issueType === 'EXPIRED_DISCOUNT_ON_DRAFT') {
       const inv = db.prepare('SELECT * FROM Invoice WHERE id = ?').get(target.entityId) as any;
-      const tax = Math.round(inv.amountSubtotal * 0.18);
+      const taxRate=getTaxRatePercent();
+      const tax = Math.round(inv.amountSubtotal * taxRate / 100);
       const total = inv.amountSubtotal + tax;
       db.prepare(`
         UPDATE Invoice
@@ -861,7 +869,7 @@ export function fixSingleLeakageIssue(issueId: string, actorId: string) {
       const subtotal = Math.round(pay.amount / 1.18);
       const tax = pay.amount - subtotal;
       const invId = `inv_linked_${crypto.randomBytes(4).toString('hex')}`;
-      const invNum = `BL-${now.getUTCFullYear()}-L${Math.floor(100 + Math.random() * 899)}`;
+      const invNum = nextInvoiceNumber(now);
 
       db.prepare(`
         INSERT INTO Invoice (id, invoiceNumber, subscriptionId, userId, billingPeriodKey, amountSubtotal, taxAmount, discountAmount, discountCode, totalAmount, status, dueDate, createdAt)
@@ -895,10 +903,18 @@ export function fixSingleLeakageIssue(issueId: string, actorId: string) {
 }
 
 export function autoReconcileAllLeakage(actorId: string) {
-  const { issues } = detectRevenueLeakage();
-  const results = [];
-  for (const issue of issues) {
-    results.push(fixSingleLeakageIssue(issue.id, actorId));
+  const results: ReturnType<typeof fixSingleLeakageIssue>[] = [];
+  const attempted = new Set<string>();
+  // Re-read findings after each correction: resolving one duplicate or missing invoice can
+  // change the IDs and impact of other findings. Missed payments need collection follow-up,
+  // and tax differences need an explicit review, so neither is auto-mutated.
+  for (let pass=0; pass<100; pass++) {
+    const next=detectRevenueLeakage().issues.find(issue=>!attempted.has(issue.id)&&['ACTIVE_SUB_WITHOUT_INVOICE','DUPLICATE_PERIOD_INVOICE','EXPIRED_DISCOUNT_ON_DRAFT','UNLINKED_SUCCESS_PAYMENT'].includes(issue.issueType));
+    if(!next)break;
+    attempted.add(next.id);
+    try { results.push(fixSingleLeakageIssue(next.id,actorId)); } catch (error:any) {
+      if(error?.message!=='Leakage issue not found or already resolved.')throw error;
+    }
   }
   return {
     reconciledCount: results.length,

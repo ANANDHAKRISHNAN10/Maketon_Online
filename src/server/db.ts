@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import crypto from 'crypto';
 import path from 'path';
 
-const dbPath = path.resolve(process.cwd(), 'brightloop.db');
+const dbPath = path.resolve(process.env.BRIGHTLOOP_DB_PATH || path.join(process.cwd(), 'brightloop.db'));
 export const db = new Database(dbPath);
 
 // Enable WAL mode and foreign keys for transactional integrity
@@ -15,6 +15,24 @@ export function hashPassword(password: string, salt = 'brightloop_salt_2026'): s
 
 export function hashPin(pin: string): string {
   return crypto.createHash('sha256').update(`pin_${pin}_brightloop`).digest('hex');
+}
+
+export function nextInvoiceNumber(date = new Date()): string {
+  const row = db.prepare("SELECT valueJson FROM AppSetting WHERE key='billing'").get() as {valueJson:string}|undefined;
+  let billing: any = {};
+  try { billing = row ? JSON.parse(row.valueJson) : {}; } catch { billing = {}; }
+  const prefix = String(billing.invoicePrefix || 'BL').replace(/[^A-Z0-9-]/gi,'').slice(0,8) || 'BL';
+  const number = Math.max(1,Math.floor(Number(billing.nextInvoiceNumber)||1001));
+  billing = { ...billing, invoicePrefix: prefix, nextInvoiceNumber: number + 1 };
+  db.prepare("INSERT INTO AppSetting(key,valueJson,updatedAt,updatedBy) VALUES('billing',?,?,NULL) ON CONFLICT(key) DO UPDATE SET valueJson=excluded.valueJson,updatedAt=excluded.updatedAt")
+    .run(JSON.stringify(billing),date.toISOString());
+  return `${prefix}-${date.getUTCFullYear()}-${String(number).padStart(6,'0')}`;
+}
+
+export function getTaxRatePercent(): number {
+  const row = db.prepare("SELECT valueJson FROM AppSetting WHERE key='billing'").get() as {valueJson:string}|undefined;
+  try { const value = row ? Number(JSON.parse(row.valueJson)?.taxRatePercent) : NaN; if (Number.isFinite(value) && value >= 0 && value <= 100) return value; } catch { /* use default */ }
+  return Number(process.env.GST_TAX_RATE_PERCENT || 18);
 }
 
 export function initDatabase() {
@@ -109,6 +127,18 @@ export function initDatabase() {
       FOREIGN KEY (userId) REFERENCES User(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS InvoiceLineItem (
+      id TEXT PRIMARY KEY,
+      invoiceId TEXT NOT NULL,
+      productId TEXT,
+      description TEXT NOT NULL,
+      quantity INTEGER NOT NULL,
+      unitPrice INTEGER NOT NULL,
+      totalAmount INTEGER NOT NULL,
+      FOREIGN KEY (invoiceId) REFERENCES Invoice(id) ON DELETE CASCADE,
+      FOREIGN KEY (productId) REFERENCES Product(id) ON DELETE SET NULL
+    );
+
     CREATE TABLE IF NOT EXISTS Payment (
       id TEXT PRIMARY KEY,
       invoiceId TEXT,
@@ -196,6 +226,40 @@ export function initDatabase() {
       updatedBy TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS LoyaltyAccount (
+      userId TEXT PRIMARY KEY,
+      availablePoints INTEGER NOT NULL DEFAULT 0,
+      totalEarnedPoints INTEGER NOT NULL DEFAULT 0,
+      redeemedPoints INTEGER NOT NULL DEFAULT 0,
+      expiringPoints INTEGER NOT NULL DEFAULT 0,
+      updatedAt TEXT NOT NULL,
+      FOREIGN KEY (userId) REFERENCES User(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS LoyaltyTransaction (
+      id TEXT PRIMARY KEY,
+      userId TEXT NOT NULL,
+      activity TEXT NOT NULL,
+      points INTEGER NOT NULL,
+      balanceAfter INTEGER NOT NULL,
+      rewardId TEXT,
+      createdAt TEXT NOT NULL,
+      FOREIGN KEY (userId) REFERENCES User(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS CustomerNotification (
+      id TEXT PRIMARY KEY,
+      userId TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      title TEXT NOT NULL,
+      message TEXT NOT NULL,
+      action TEXT,
+      readAt TEXT,
+      createdAt TEXT NOT NULL,
+      UNIQUE(userId, kind, action),
+      FOREIGN KEY (userId) REFERENCES User(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS CustomerDispute (
       id TEXT PRIMARY KEY,
       customerId TEXT NOT NULL,
@@ -223,6 +287,7 @@ export function initDatabase() {
   if (!userColumns.has('isActive')) db.exec('ALTER TABLE User ADD COLUMN isActive INTEGER NOT NULL DEFAULT 1');
   if (!userColumns.has('permissionsJson')) db.exec("ALTER TABLE User ADD COLUMN permissionsJson TEXT NOT NULL DEFAULT '[]'");
   if (!userColumns.has('staffRole')) db.exec("ALTER TABLE User ADD COLUMN staffRole TEXT NOT NULL DEFAULT 'Operations'");
+  db.prepare("UPDATE User SET permissionsJson='[\"customers.read\",\"customers.write\",\"subscriptions.read\",\"subscriptions.write\",\"billing.read\",\"billing.write\",\"reports.read\",\"security.read\"]' WHERE role='STAFF' AND permissionsJson='[]'").run();
   if (!discountColumns.has('minPurchaseCents')) db.exec('ALTER TABLE Discount ADD COLUMN minPurchaseCents INTEGER NOT NULL DEFAULT 0');
   if (!discountColumns.has('productIdsJson')) db.exec("ALTER TABLE Discount ADD COLUMN productIdsJson TEXT NOT NULL DEFAULT '[]'");
   if (!discountColumns.has('planIdsJson')) db.exec("ALTER TABLE Discount ADD COLUMN planIdsJson TEXT NOT NULL DEFAULT '[]'");
@@ -236,6 +301,9 @@ export function seedDatabase(forceReset = false) {
     db.exec(`
       DELETE FROM CustomerDispute;
       DELETE FROM AuditLog;
+      DELETE FROM CustomerNotification;
+      DELETE FROM LoyaltyTransaction;
+      DELETE FROM LoyaltyAccount;
       DELETE FROM LoginActivity;
       DELETE FROM PauseHistory;
       DELETE FROM SecurityLog;
@@ -901,4 +969,11 @@ export function seedDatabase(forceReset = false) {
   });
 
   seedTx();
+  db.prepare("UPDATE User SET permissionsJson='[\"customers.read\",\"customers.write\",\"subscriptions.read\",\"subscriptions.write\",\"billing.read\",\"billing.write\",\"catalog.read\",\"catalog.write\",\"reports.read\",\"security.read\"]' WHERE role='STAFF' AND permissionsJson='[]'").run();
+
+  const loyaltySeed = db.prepare(`INSERT OR IGNORE INTO LoyaltyAccount(userId,availablePoints,totalEarnedPoints,redeemedPoints,expiringPoints,updatedAt) VALUES(?,?,?,?,?,?)`);
+  const nowIso = now.toISOString();
+  for (const [userId, points] of [['usr_gamer_1',1240],['usr_gamer_2',860],['usr_gamer_3',420],['usr_gamer_4',1570],['usr_gamer_5',1000]] as Array<[string,number]>) {
+    loyaltySeed.run(userId,points,points+3000,3000,Math.min(240,points),nowIso);
+  }
 }

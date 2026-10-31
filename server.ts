@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import express, { NextFunction, Request, Response } from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
-import { db, hashPassword, hashPin, seedDatabase } from './src/server/db';
+import { db, getTaxRatePercent, hashPassword, hashPin, nextInvoiceNumber, seedDatabase } from './src/server/db';
 import {
   autoReconcileAllLeakage,
   buildExecutiveReportMarkdown,
@@ -27,6 +27,23 @@ import {
 
 // Initialize and seed SQLite database on server start
 seedDatabase(false);
+
+function expireElapsedSubscriptions(){
+  const now=new Date().toISOString();
+  const elapsed=db.prepare("SELECT id,userId,currentPeriodEnd FROM Subscription WHERE status='ACTIVE' AND currentPeriodEnd<=?").all(now) as any[];
+  if(!elapsed.length)return 0;
+  const tx=db.transaction(()=>{
+    for(const sub of elapsed){
+      const changed=db.prepare("UPDATE Subscription SET status='EXPIRED',perksFrozen=1 WHERE id=? AND status='ACTIVE'").run(sub.id);
+      if(!changed.changes)continue;
+      db.prepare("INSERT INTO AuditLog(id,actorId,action,entityType,entityId,metadata,createdAt) VALUES(?,NULL,'EXPIRE_SUBSCRIPTION','Subscription',?,?,?)")
+        .run(`aud_exp_${crypto.randomBytes(5).toString('hex')}`,sub.id,JSON.stringify({periodEnd:sub.currentPeriodEnd,automatic:true}),now);
+      if((readAppSettings().notifications as any).expiryNotifications)db.prepare(`INSERT OR IGNORE INTO CustomerNotification(id,userId,kind,title,message,action,createdAt) VALUES(?,?, 'EXPIRY_NOTICE','Your membership period ended','Your Brightloop membership period has ended. Choose a plan to continue playing.',?,?)`)
+        .run(`notice_${sub.userId}_${sub.id}_expired`,sub.userId,`expired:${sub.id}`,now);
+    }
+  });
+  tx();return elapsed.length;
+}
 
 const app = express();
 app.use(express.json());
@@ -78,9 +95,30 @@ function requireAuth(roles?: Array<'ADMIN' | 'STAFF' | 'GAMER'>) {
         error: `Forbidden: Requires ${roles.join(' or ')} role (current role: ${user.role}).`,
       });
     }
+    if(user.role==='STAFF'){
+      const permission=requiredStaffPermission(req.path,req.method);
+      if(permission){
+        const row=db.prepare('SELECT permissionsJson FROM User WHERE id=?').get(user.id) as any;
+        let granted:string[]=[];try{granted=JSON.parse(row?.permissionsJson||'[]');}catch{granted=[];}
+        if(!granted.includes(permission))return res.status(403).json({error:`This staff account does not have the ${permission} permission.`});
+      }
+    }
     (req as any).user = user;
     next();
   };
+}
+
+function requiredStaffPermission(pathname:string,method:string):string|null{
+  const write=!['GET','HEAD','OPTIONS'].includes(method.toUpperCase());
+  if(pathname.startsWith('/api/admin/settings')||pathname.startsWith('/api/admin/staff')||pathname.startsWith('/api/admin/sessions'))return 'workspace.manage';
+  if(pathname.startsWith('/api/admin/products')||pathname.startsWith('/api/admin/plans')||pathname.startsWith('/api/admin/discounts'))return write?'catalog.write':'catalog.read';
+  if(pathname.startsWith('/api/admin/customers')||pathname.startsWith('/api/admin/disputes'))return write?'customers.write':'customers.read';
+  if(pathname.startsWith('/api/admin/subscriptions')||pathname.startsWith('/api/subscriptions/'))return write?'subscriptions.write':'subscriptions.read';
+  if(pathname.startsWith('/api/admin/billing')||pathname.startsWith('/api/admin/invoices')||pathname.startsWith('/api/admin/payments')||pathname.startsWith('/api/billing/'))return write?'billing.write':'billing.read';
+  if(pathname.startsWith('/api/intelligence/'))return pathname.includes('retention')?'customers.write':pathname.includes('collection')?'billing.write':'reports.read';
+  if(pathname.startsWith('/api/security/'))return write?'security.write':'security.read';
+  if(pathname.startsWith('/api/admin/overview'))return 'reports.read';
+  return null;
 }
 
 // --- PUBLIC CATALOG & STATS ENDPOINTS ---
@@ -109,6 +147,9 @@ app.get('/api/public/catalog', (_req, res) => {
     plans,
     products,
     discounts,
+    paymentMethods: (readAppSettings().billing as any).paymentMethods,
+    currency: (readAppSettings().general as any).currency,
+    taxRatePercent: getTaxRatePercent(),
     stats: {
       gamesIncluded: '180+',
       activeGamers: '48,500+',
@@ -127,6 +168,7 @@ app.get('/api/auth/demo-accounts', (_req, res) => {
     FROM User u
     LEFT JOIN Subscription s ON s.userId = u.id
     LEFT JOIN Plan p ON p.id = s.planId
+    WHERE u.isActive = 1
     ORDER BY CASE u.role WHEN 'ADMIN' THEN 1 WHEN 'STAFF' THEN 2 ELSE 3 END, u.name ASC
   `).all();
   res.json({ accounts: users });
@@ -148,42 +190,16 @@ app.post('/api/auth/register', (req, res) => {
   const nowIso = new Date().toISOString();
   const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.socket.remoteAddress || '198.51.100.50';
 
+  const policy = (readAppSettings().security as any);
+  if (password.length < Number(policy.minimumPasswordLength) || (policy.requireUppercase && !/[A-Z]/.test(password)) || (policy.requireNumber && !/\d/.test(password)) || (policy.requireSymbol && !/[^A-Za-z0-9]/.test(password))) {
+    return res.status(400).json({ error: 'Password does not meet the current workspace security policy.' });
+  }
   const tx = db.transaction(() => {
-    db.prepare(`
-      INSERT INTO User (id, name, email, passwordHash, role, parentEmail, parentalPinHash, parentalGateOn, lastLoginIp, lastLoginCountry, lastLoginAt, isFrozen, tradeLockUntil, createdAt)
-      VALUES (?, ?, ?, ?, 'GAMER', ?, ?, ?, ?, 'US', ?, 0, NULL, ?)
-    `).run(
-      userId,
-      name,
-      email.toLowerCase(),
-      hashPassword(password),
-      parentEmail || null,
-      parentalPin ? hashPin(parentalPin) : null,
-      parentalPin ? 1 : 0,
-      clientIp,
-      nowIso,
-      nowIso
-    );
-
-    // Provision a default Monthly Champion Tier subscription + initial invoice
-    const subId = `sub_${crypto.randomBytes(5).toString('hex')}`;
-    const periodEnd = new Date(Date.now() + 30 * 86400000).toISOString();
-    db.prepare(`
-      INSERT INTO Subscription (id, userId, planId, status, currentPeriodStart, currentPeriodEnd, perksFrozen, createdAt)
-      VALUES (?, ?, 'plan_monthly_champion', 'ACTIVE', ?, ?, 0, ?)
-    `).run(subId, userId, nowIso, periodEnd, nowIso);
-
-    const invId = `inv_${crypto.randomBytes(5).toString('hex')}`;
-    const invNum = `BL-2026-${Math.floor(1000 + Math.random() * 9000)}`;
-    db.prepare(`
-      INSERT INTO Invoice (id, invoiceNumber, subscriptionId, userId, billingPeriodKey, amountSubtotal, taxAmount, discountAmount, totalAmount, status, dueDate, createdAt)
-      VALUES (?, ?, ?, ?, '2026-10', 1499, 270, 0, 1769, 'PAID', ?, ?)
-    `).run(invId, invNum, subId, userId, nowIso, nowIso);
-
-    db.prepare(`
-      INSERT INTO Payment (id, invoiceId, userId, amount, method, status, referenceCode, ipAddress, createdAt)
-      VALUES (?, ?, ?, 1769, 'CREDIT_CARD', 'SUCCESS', ?, ?, ?)
-    `).run(`pay_${crypto.randomBytes(4).toString('hex')}`, invId, userId, `TXN-${Math.floor(100000 + Math.random() * 899999)}`, clientIp, nowIso);
+    db.prepare(`INSERT INTO User (id,name,email,passwordHash,role,parentEmail,parentalPinHash,parentalGateOn,lastLoginIp,lastLoginCountry,lastLoginAt,isFrozen,tradeLockUntil,createdAt) VALUES (?,?,?,?, 'GAMER',?,?,?,?,'US',?,0,NULL,?)`)
+      .run(userId,name,email.toLowerCase(),hashPassword(password),parentEmail||null,parentalPin?hashPin(parentalPin):null,parentalPin?1:0,clientIp,nowIso,nowIso);
+    db.prepare('INSERT INTO LoyaltyAccount(userId,availablePoints,totalEarnedPoints,redeemedPoints,expiringPoints,updatedAt) VALUES (?,1000,1000,0,0,?)').run(userId,nowIso);
+    db.prepare('INSERT INTO LoyaltyTransaction(id,userId,activity,points,balanceAfter,createdAt) VALUES (?,?,?,?,?,?)')
+      .run(`loy_${crypto.randomBytes(6).toString('hex')}`,userId,'Welcome to Brightloop',1000,1000,nowIso);
   });
 
   tx();
@@ -214,6 +230,12 @@ app.post('/api/auth/login', (req, res) => {
   }
 
   const now = new Date();
+  if (user.role === 'GAMER' && user.lastLoginAt && now.getTime()-new Date(user.lastLoginAt).getTime() >= 30*86400000) {
+    const awayDays=Math.floor((now.getTime()-new Date(user.lastLoginAt).getTime())/86400000);
+    const awaySubs=db.prepare("SELECT id FROM Subscription WHERE userId=? AND status='ACTIVE'").all(user.id) as any[];
+    for(const sub of awaySubs)db.prepare(`INSERT OR IGNORE INTO CustomerNotification(id,userId,kind,title,message,action,createdAt) VALUES(?,?, 'PAUSE_OFFER','Take a break when you need one',?,?,?)`)
+      .run(`notice_${user.id}_${sub.id}_pause`,user.id,`You have been away for ${awayDays} days. Pause your eligible plan to keep the remaining membership time.`,`pause:${sub.id}`,now.toISOString());
+  }
   const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.socket.remoteAddress || '203.0.113.10';
   const loginCountry = simulatedCountry || user.lastLoginCountry || 'US';
   const currentAgent = req.headers['user-agent'] || 'Browser';
@@ -364,6 +386,32 @@ app.get('/api/gamer/dashboard', requireAuth(['GAMER', 'ADMIN', 'STAFF']), (req, 
     ORDER BY p.createdAt DESC
   `).all(targetUserId);
 
+  const activeForNotices = db.prepare("SELECT id,currentPeriodEnd FROM Subscription WHERE userId=? AND status='ACTIVE'").all(targetUserId) as any[];
+  const billingSettings=readAppSettings().billing as any;
+  const notificationSettings=readAppSettings().notifications as any;
+  const reminderDays = Number(billingSettings.renewalDays ?? 3);
+  const nowMs = Date.now();
+  for (const sub of activeForNotices) {
+    if (user.lastLoginAt && nowMs - new Date(user.lastLoginAt).getTime() >= 30 * 86400000) {
+      db.prepare(`INSERT OR IGNORE INTO CustomerNotification(id,userId,kind,title,message,action,createdAt) VALUES(?,?, 'PAUSE_OFFER','Take a break when you need one','You have been away for a while. Pause your eligible plan and keep the remaining membership time.',?,?)`)
+        .run(`notice_${targetUserId}_${sub.id}_pause`,targetUserId,`pause:${sub.id}`,new Date().toISOString());
+    }
+    const daysLeft=(new Date(sub.currentPeriodEnd).getTime()-nowMs)/86400000;
+    if (notificationSettings.renewalReminders && daysLeft >= 0 && daysLeft <= reminderDays) {
+      db.prepare(`INSERT OR IGNORE INTO CustomerNotification(id,userId,kind,title,message,action,createdAt) VALUES(?,?, 'RENEWAL_REMINDER','Your renewal is coming up','Your Brightloop membership is scheduled to renew soon. Review billing details in your account.',?,?)`)
+        .run(`notice_${targetUserId}_${sub.id}_renewal`,targetUserId,`renewal:${sub.id}`,new Date().toISOString());
+    }
+    if(notificationSettings.expiryNotifications&&daysLeft>=0&&daysLeft<=7)db.prepare(`INSERT OR IGNORE INTO CustomerNotification(id,userId,kind,title,message,action,createdAt) VALUES(?,?, 'EXPIRY_NOTICE','Your membership is nearing its end','Your current membership period is almost over. Review your plan and renewal details.',?,?)`)
+      .run(`notice_${targetUserId}_${sub.id}_expiry`,targetUserId,`expiry:${sub.id}`,new Date().toISOString());
+  }
+  if(notificationSettings.collectionReminders){
+    const pastDue=db.prepare("SELECT id,invoiceNumber,totalAmount FROM Invoice WHERE userId=? AND status IN ('CONFIRMED','OVERDUE') AND dueDate<?").all(targetUserId,new Date().toISOString()) as any[];
+    for(const invoice of pastDue)db.prepare(`INSERT OR IGNORE INTO CustomerNotification(id,userId,kind,title,message,action,createdAt) VALUES(?,?, 'COLLECTION_REMINDER','A payment needs your attention',?,?,?)`)
+      .run(`notice_${targetUserId}_${invoice.id}_collection`,targetUserId,`Invoice ${invoice.invoiceNumber} has an outstanding balance of $${(invoice.totalAmount/100).toFixed(2)}. Review your invoices to make a payment.`,`invoice:${invoice.id}`,new Date().toISOString());
+  }
+  const notifications=db.prepare('SELECT * FROM CustomerNotification WHERE userId=? ORDER BY createdAt DESC LIMIT 12').all(targetUserId);
+  const loyaltyAccount=db.prepare('SELECT availablePoints,totalEarnedPoints,redeemedPoints,expiringPoints FROM LoyaltyAccount WHERE userId=?').get(targetUserId) as any || {availablePoints:0,totalEarnedPoints:0,redeemedPoints:0,expiringPoints:0};
+
   const pauseHistory = subscription
     ? db.prepare('SELECT * FROM PauseHistory WHERE subscriptionId = ? ORDER BY createdAt DESC').all(subscription.id)
     : [];
@@ -392,20 +440,63 @@ app.get('/api/gamer/dashboard', requireAuth(['GAMER', 'ADMIN', 'STAFF']), (req, 
       : null,
     invoices,
     payments,
+    notifications,
+    loyalty: loyaltyAccount,
     pauseHistory,
     availablePlans: allPlans,
   });
 });
 
+app.get('/api/gamer/loyalty', requireAuth(['GAMER']), (req,res)=>{
+  const actor=(req as any).user as SessionUser;
+  const account=db.prepare('SELECT availablePoints,totalEarnedPoints,redeemedPoints,expiringPoints FROM LoyaltyAccount WHERE userId=?').get(actor.id) as any;
+  if(!account)return res.json({available:0,earned:0,redeemed:0,expiring:0,transactions:[]});
+  const transactions=db.prepare('SELECT id,createdAt as date,activity,points,balanceAfter as balance,rewardId FROM LoyaltyTransaction WHERE userId=? ORDER BY createdAt DESC LIMIT 100').all(actor.id);
+  res.json({available:account.availablePoints,earned:account.totalEarnedPoints,redeemed:account.redeemedPoints,expiring:account.expiringPoints,transactions});
+});
+
+app.post('/api/gamer/loyalty/redeem', requireAuth(['GAMER']), (req,res)=>{
+  const actor=(req as any).user as SessionUser;
+  const catalog:Record<string,{name:string;points:number;minPlanPrice?:number}>={
+    'sub-5':{name:'$5 subscription credit',points:500},'sub-10':{name:'$10 subscription credit',points:1000},
+    'day-pass':{name:'One free premium day',points:700,minPlanPrice:1499},'gems':{name:'1,000 Brightloop gems',points:900},
+    'avatar':{name:'Legend avatar collection',points:1100},'founder':{name:'Brightloop founder bundle',points:1500,minPlanPrice:1499},'squad':{name:'Squad night game bundle',points:2200},
+  };
+  const reward=catalog[String(req.body?.rewardId||'')];
+  if(!reward)return res.status(400).json({error:'Choose a valid Brightloop reward.'});
+  const tx=db.transaction(()=>{
+    const account=db.prepare('SELECT * FROM LoyaltyAccount WHERE userId=?').get(actor.id) as any;
+    if(!account)return {error:'Loyalty account is not available.'};
+    if(reward.minPlanPrice){const eligible=db.prepare("SELECT 1 FROM Subscription s JOIN Plan p ON p.id=s.planId WHERE s.userId=? AND s.status='ACTIVE' AND p.price>=? LIMIT 1").get(actor.id,reward.minPlanPrice);if(!eligible)return {error:'This reward requires an active Pro or Ultimate subscription.'};}
+    if(account.availablePoints<reward.points)return {error:`You need ${reward.points-account.availablePoints} more points to redeem this reward.`};
+    const now=new Date().toISOString();const balance=account.availablePoints-reward.points;
+    db.prepare('UPDATE LoyaltyAccount SET availablePoints=?,redeemedPoints=redeemedPoints+?,expiringPoints=MAX(0,expiringPoints-MIN(expiringPoints,?)),updatedAt=? WHERE userId=?')
+      .run(balance,reward.points,reward.points,now,actor.id);
+    const id=`loy_${crypto.randomBytes(6).toString('hex')}`;
+    db.prepare('INSERT INTO LoyaltyTransaction(id,userId,activity,points,balanceAfter,rewardId,createdAt) VALUES(?,?,?,?,?,?,?)').run(id,actor.id,`Redeemed: ${reward.name}`,-reward.points,balance,req.body.rewardId,now);
+    db.prepare('INSERT INTO AuditLog(id,actorId,action,entityType,entityId,metadata,createdAt) VALUES(?,? ,\'REDEEM_LOYALTY_REWARD\',\'Customer\',?,?,?)').run(`aud_${crypto.randomBytes(5).toString('hex')}`,actor.id,actor.id,JSON.stringify({rewardId:req.body.rewardId,points:reward.points}),now);
+    return {balance,points:reward.points,reward:reward.name};
+  });
+  const result=tx();if((result as any).error)return res.status(400).json({error:(result as any).error});
+  res.json({message:'Reward redeemed.',...result});
+});
+
+app.post('/api/gamer/notifications/:id/read', requireAuth(['GAMER']), (req,res)=>{
+  const actor=(req as any).user as SessionUser;
+  const changed=db.prepare('UPDATE CustomerNotification SET readAt=? WHERE id=? AND userId=?').run(new Date().toISOString(),req.params.id,actor.id);
+  if(!changed.changes)return res.status(404).json({error:'Notification not found.'});
+  res.json({message:'Notification marked as read.'});
+});
+
 // Subscribe / Upgrade / Renew with Parental Safety Gate PIN check
-app.post('/api/gamer/subscribe', requireAuth(['GAMER', 'ADMIN', 'STAFF']), (req, res) => {
+app.post('/api/gamer/subscribe', requireAuth(['GAMER']), (req, res) => {
   const sessionUser = (req as any).user as SessionUser;
   const parsed = SubscribePlanSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0].message });
   }
 
-  const { planId, discountCode, paymentMethod, parentalPin } = parsed.data;
+  const { planId, discountCode, paymentMethod, parentalPin, products } = parsed.data;
   const user = db.prepare('SELECT * FROM User WHERE id = ?').get(sessionUser.id) as any;
   if (!user) {
     return res.status(404).json({ error: 'User not found.' });
@@ -437,6 +528,17 @@ app.post('/api/gamer/subscribe', requireAuth(['GAMER', 'ADMIN', 'STAFF']), (req,
   if (!plan) {
     return res.status(404).json({ error: 'Selected plan not found.' });
   }
+  const selectedProducts:any[] = [];
+  for (const item of products) {
+    const product = db.prepare('SELECT id,name,basePrice,isActive FROM Product WHERE id=?').get(item.productId) as any;
+    if (!product || !product.isActive) return res.status(400).json({error:'One of the selected add-ons is unavailable.'});
+    selectedProducts.push({ ...product, quantity: item.quantity, total: product.basePrice * item.quantity });
+  }
+  const subtotal = plan.price + selectedProducts.reduce((sum,item)=>sum+item.total,0);
+  const quantity = 1 + selectedProducts.reduce((sum,item)=>sum+item.quantity,0);
+  const billingMethods=(readAppSettings().billing as any).paymentMethods||{};
+  const methodKey=paymentMethod==='CREDIT_CARD'?'card':paymentMethod==='UPI'?'upi':'wallet';
+  if(billingMethods[methodKey]===false)return res.status(400).json({error:'That payment method is currently disabled.'});
 
   const now = new Date();
   const periodDays =
@@ -455,6 +557,7 @@ app.post('/api/gamer/subscribe', requireAuth(['GAMER', 'ADMIN', 'STAFF']), (req,
     let discountAmount = 0;
     let appliedCode: string | null = null;
     const existingSub = db.prepare('SELECT * FROM Subscription WHERE userId = ? ORDER BY createdAt DESC LIMIT 1').get(user.id) as any;
+    if (existingSub?.status === 'ACTIVE' && existingSub.planId === plan.id) throw new Error('You already have this active plan. Manage your current subscription from your account.');
 
     if (discountCode) {
       const d = db.prepare('SELECT * FROM Discount WHERE code = ?').get(discountCode.toUpperCase()) as any;
@@ -463,14 +566,16 @@ app.post('/api/gamer/subscribe', requireAuth(['GAMER', 'ADMIN', 'STAFF']), (req,
       }
       const applicablePlans = JSON.parse(d.planIdsJson || '[]') as string[];
       if (applicablePlans.length && !applicablePlans.includes(plan.id)) throw new Error('This discount is not valid for the selected plan.');
-      if (plan.price < Number(d.minPurchaseCents || 0)) throw new Error('The selected plan does not meet this discount’s minimum purchase amount.');
+      const applicableProducts = JSON.parse(d.productIdsJson || '[]') as string[];
+      if (applicableProducts.length && !selectedProducts.some(product=>applicableProducts.includes(product.id))) throw new Error('Add an eligible product to use this discount.');
+      if (subtotal < Number(d.minPurchaseCents || 0)) throw new Error('The selected items do not meet this discount’s minimum purchase amount.');
       if (d.customerEligibility === 'NEW' && existingSub) throw new Error('This discount is available to new customers only.');
       if (d.customerEligibility === 'EXISTING' && !existingSub) throw new Error('This discount is available to existing customers only.');
-      if (d.minQuantity > 1) throw new Error('This discount requires a multi item purchase and cannot be used on a single plan checkout.');
+      if (quantity < d.minQuantity) throw new Error(`This discount requires a purchase quantity of at least ${d.minQuantity}.`);
       discountAmount =
         d.type === 'PERCENT'
-          ? Math.round((plan.price * d.value) / 100)
-          : Math.min(plan.price, d.value);
+          ? Math.round((subtotal * d.value) / 100)
+          : Math.min(subtotal, d.value);
       appliedCode = d.code;
       db.prepare('UPDATE Discount SET usedCount = usedCount + 1 WHERE id = ?').run(d.id);
     }
@@ -492,12 +597,12 @@ app.post('/api/gamer/subscribe', requireAuth(['GAMER', 'ADMIN', 'STAFF']), (req,
       `).run(subId, user.id, plan.id, now.toISOString(), periodEnd, now.toISOString());
     }
 
-    const taxable = Math.max(0, plan.price - discountAmount);
-    const taxAmount = Math.round(taxable * 0.18);
+    const taxable = Math.max(0, subtotal - discountAmount);
+    const taxAmount = Math.round(taxable * Number((readAppSettings().billing as any).taxRatePercent ?? 18) / 100);
     const totalAmount = taxable + taxAmount;
 
     const invId = `inv_${crypto.randomBytes(5).toString('hex')}`;
-    const invNum = `BL-${now.getUTCFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
+    const invNum = nextInvoiceNumber(now);
     const periodKey = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${plan.id}`;
 
     db.prepare(`
@@ -509,7 +614,7 @@ app.post('/api/gamer/subscribe', requireAuth(['GAMER', 'ADMIN', 'STAFF']), (req,
       subId,
       user.id,
       periodKey,
-      plan.price,
+      subtotal,
       taxAmount,
       discountAmount,
       appliedCode,
@@ -517,6 +622,9 @@ app.post('/api/gamer/subscribe', requireAuth(['GAMER', 'ADMIN', 'STAFF']), (req,
       now.toISOString(),
       now.toISOString()
     );
+    const insertLine=db.prepare('INSERT INTO InvoiceLineItem(id,invoiceId,productId,description,quantity,unitPrice,totalAmount) VALUES(?,?,?,?,?,?,?)');
+    insertLine.run(`line_${crypto.randomBytes(5).toString('hex')}`,invId,null,plan.name,1,plan.price,plan.price);
+    for(const product of selectedProducts)insertLine.run(`line_${crypto.randomBytes(5).toString('hex')}`,invId,product.id,product.name,product.quantity,product.basePrice,product.total);
 
     const payId = `pay_${crypto.randomBytes(5).toString('hex')}`;
     db.prepare(`
@@ -528,18 +636,18 @@ app.post('/api/gamer/subscribe', requireAuth(['GAMER', 'ADMIN', 'STAFF']), (req,
       user.id,
       totalAmount,
       paymentMethod,
-      `TXN-${Math.floor(100000 + Math.random() * 899999)}`,
+      `DEMO-${crypto.randomBytes(6).toString('hex').toUpperCase()}`,
       user.lastLoginIp || '203.0.113.45',
       now.toISOString()
     );
 
-    return { subId, invoiceNumber: invNum, totalAmount, nextBillingDate: periodEnd };
+    return { subId, invoiceNumber: invNum, subtotal, discountAmount, taxAmount, totalAmount, nextBillingDate: periodEnd, paymentMode: 'SIMULATED_DEMO' as const };
   });
 
   try {
     const result = tx();
     res.json({
-      message: `Successfully activated ${plan.name}!`,
+      message: `Successfully activated ${plan.name} with a simulated demo payment.`,
       ...result,
     });
   } catch (err: any) {
@@ -621,6 +729,7 @@ app.put('/api/gamer/profile', requireAuth(), (req, res) => {
 app.post('/api/gamer/invoices/:id/pay', requireAuth(), (req, res) => {
   const sessionUser = (req as any).user as SessionUser;
   const { parentalPin, method = 'CREDIT_CARD' } = req.body;
+  const outcome = req.body?.simulateOutcome === 'FAILED' ? 'FAILED' : 'SUCCESS';
 
   const inv = db.prepare('SELECT * FROM Invoice WHERE id = ?').get(req.params.id) as any;
   if (!inv) {
@@ -629,6 +738,13 @@ app.post('/api/gamer/invoices/:id/pay', requireAuth(), (req, res) => {
   if (sessionUser.role === 'GAMER' && inv.userId !== sessionUser.id) {
     return res.status(403).json({ error: 'Forbidden.' });
   }
+  if (['PAID','CANCELLED'].includes(inv.status)) return res.status(409).json({error:inv.status==='PAID'?'This invoice is already paid.':'This invoice is cancelled.'});
+  if (!['CONFIRMED','OVERDUE','FAILED'].includes(inv.status)) return res.status(400).json({error:'Only confirmed or overdue invoices can be paid.'});
+  if (!['CREDIT_CARD','UPI','WALLET'].includes(String(method))) return res.status(400).json({error:'Choose a supported payment method.'});
+  const billingMethods=(readAppSettings().billing as any).paymentMethods||{};
+  const enabledMethod = method==='CREDIT_CARD'?'card':method==='UPI'?'upi':'wallet';
+  if (billingMethods[enabledMethod]===false) return res.status(400).json({error:'That payment method is currently disabled.'});
+  if (db.prepare("SELECT id FROM Payment WHERE invoiceId=? AND status='SUCCESS' LIMIT 1").get(inv.id)) return res.status(409).json({error:'A successful payment is already linked to this invoice.'});
 
   const user = db.prepare('SELECT * FROM User WHERE id = ?').get(inv.userId) as any;
   if (user?.parentalGateOn && sessionUser.role === 'GAMER') {
@@ -646,24 +762,35 @@ app.post('/api/gamer/invoices/:id/pay', requireAuth(), (req, res) => {
 
   const nowIso = new Date().toISOString();
   const tx = db.transaction(() => {
-    db.prepare(`UPDATE Invoice SET status = 'PAID' WHERE id = ?`).run(inv.id);
+    const reference=`DEMO-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
+    db.prepare(`UPDATE Invoice SET status = ? WHERE id = ?`).run(outcome==='SUCCESS'?'PAID':(new Date(inv.dueDate).getTime()<Date.now()?'OVERDUE':'CONFIRMED'),inv.id);
     db.prepare(`
       INSERT INTO Payment (id, invoiceId, userId, amount, method, status, referenceCode, ipAddress, createdAt)
-      VALUES (?, ?, ?, ?, ?, 'SUCCESS', ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       `pay_${crypto.randomBytes(5).toString('hex')}`,
       inv.id,
       inv.userId,
       inv.totalAmount,
       method,
-      `TXN-${Math.floor(100000 + Math.random() * 899999)}`,
+      outcome,
+      reference,
       user?.lastLoginIp || '203.0.113.45',
       nowIso
     );
+    if(outcome==='FAILED'){
+      const attempts=(db.prepare("SELECT COUNT(*) as count FROM Payment WHERE userId=? AND status='FAILED' AND createdAt>=?").get(inv.userId,new Date(Date.now()-24*3600000).toISOString()) as any).count;
+      db.prepare(`INSERT INTO SecurityLog(id,userId,ipAddress,userAgent,eventType,severity,details,resolved,createdAt) VALUES(?,?,?,?, 'PAYMENT_FAILURE',?,?,0,?)`)
+        .run(`sec_pay_${crypto.randomBytes(5).toString('hex')}`,inv.userId,user?.lastLoginIp||'unknown',req.headers['user-agent']||'Browser',attempts>=3?'HIGH':'MEDIUM',JSON.stringify({invoiceId:inv.id,invoiceNumber:inv.invoiceNumber,amountCents:inv.totalAmount,failedAttempts:attempts,description:`A demo payment attempt failed for invoice ${inv.invoiceNumber}. The invoice remains unpaid.`}),nowIso);
+      if((readAppSettings().notifications as any).failedPaymentAlerts)db.prepare(`INSERT OR IGNORE INTO CustomerNotification(id,userId,kind,title,message,action,createdAt) VALUES(?,?, 'PAYMENT_FAILED','Payment could not be completed',?,?,?)`)
+        .run(`notice_${inv.userId}_${inv.id}_payment`,inv.userId,`The demo payment for ${inv.invoiceNumber} did not complete. Your invoice remains outstanding.`,`payment:${inv.id}`,nowIso);
+    }
+    return {reference,status:outcome};
   });
 
-  tx();
-  res.json({ message: `Invoice ${inv.invoiceNumber} paid successfully.` });
+  const result=tx();
+  if(outcome==='FAILED') return res.status(402).json({error:`The simulated payment for ${inv.invoiceNumber} failed. The invoice is still outstanding.`,paymentStatus:'FAILED',referenceCode:result.reference,simulation:true});
+  res.json({ message: `Invoice ${inv.invoiceNumber} paid successfully in the demo payment flow.`, referenceCode:result.reference,simulation:true });
 });
 
 // --- REQUIRED BILLING APIs (SECTION 8) ---
@@ -729,7 +856,7 @@ const settingsDefaults = {
   billing: { defaultCycle: 'MONTHLY', taxRatePercent: 18, renewalDays: 3, invoicePrefix: 'BL', nextInvoiceNumber: 1001, paymentMethods: { card: true, upi: true, wallet: true } },
   notifications: { renewalReminders: true, failedPaymentAlerts: true, expiryNotifications: true, fraudAlerts: true, collectionReminders: true },
   security: { minimumPasswordLength: 8, requireUppercase: true, requireNumber: true, requireSymbol: true, twoFactorRequired: false, sessionTimeoutMinutes: 60 },
-  staffPermissions: { STAFF: ['customers.read', 'subscriptions.read', 'billing.read', 'billing.write', 'reports.read'] },
+  staffPermissions: { STAFF: ['customers.read','customers.write','subscriptions.read','subscriptions.write','billing.read','billing.write','catalog.read','catalog.write','reports.read','security.read','security.write'] },
 };
 
 function readAppSettings() {
@@ -737,6 +864,9 @@ function readAppSettings() {
   const saved = Object.fromEntries(rows.map(row => { try { return [row.key, JSON.parse(row.valueJson)]; } catch { return [row.key, null]; } }));
   return Object.fromEntries(Object.entries(settingsDefaults).map(([key, value]) => [key, saved[key] && typeof saved[key] === 'object' ? { ...value, ...saved[key] } : value]));
 }
+
+expireElapsedSubscriptions();
+const expiryTimer=setInterval(expireElapsedSubscriptions,60_000);expiryTimer.unref();
 
 function auditSetting(actorId: string, action: string, entityId: string, metadata: unknown) {
   db.prepare('INSERT INTO AuditLog (id,actorId,action,entityType,entityId,metadata,createdAt) VALUES (?,?,?,?,?,?,?)')
@@ -847,6 +977,7 @@ app.get('/api/admin/overview', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
     SELECT COALESCE(SUM(totalAmount), 0) as total, COUNT(*) as count
     FROM Invoice WHERE status IN ('DRAFT', 'CONFIRMED', 'OVERDUE')
   `).get() as { total: number; count: number };
+  const totalRevenueCents=Number((db.prepare("SELECT COALESCE(SUM(amount),0) as total FROM Payment WHERE status IN ('SUCCESS','REFUNDED')").get() as any).total||0);
 
   const leakage = detectRevenueLeakage();
   const churn = calculateChurnPredictions();
@@ -854,15 +985,22 @@ app.get('/api/admin/overview', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
   const highRiskRevenueCents = churn.groups.highRisk.reduce((sum, s) => sum + s.planPriceCents, 0);
   const revenueAtRiskCents = leakage.totalLeakageCents + highRiskRevenueCents;
 
-  // Monthly growth chart data
-  const growthChart = [
-    { month: 'May', mrr: 94.5, activeSubscribers: 3, churnRate: 4.8 },
-    { month: 'Jun', mrr: 112.0, activeSubscribers: 4, churnRate: 4.2 },
-    { month: 'Jul', mrr: 128.4, activeSubscribers: 4, churnRate: 3.9 },
-    { month: 'Aug', mrr: 141.9, activeSubscribers: 5, churnRate: 3.5 },
-    { month: 'Sep', mrr: 154.9, activeSubscribers: 5, churnRate: 3.1 },
-    { month: 'Oct', mrr: Number((mrrCents / 100).toFixed(2)), activeSubscribers: activeSubs.length, churnRate: Number(((closedSubsCount / Math.max(1, allSubsCount)) * 100 + 2.4).toFixed(1)) },
-  ];
+  // Six month trend is derived from subscription records and recorded payment/cancellation events.
+  const trendMonths=Array.from({length:6},(_,i)=>new Date(new Date().getFullYear(),new Date().getMonth()-(5-i),1));
+  const cancellationRows=db.prepare("SELECT entityId,createdAt FROM AuditLog WHERE action='CANCEL_SUBSCRIPTION'").all() as any[];
+  const cancelledAt=new Map<string,string>();for(const row of cancellationRows)if(!cancelledAt.has(row.entityId))cancelledAt.set(row.entityId,row.createdAt);
+  const growthChart=trendMonths.map(month=>{
+    const start=new Date(month.getFullYear(),month.getMonth(),1);const end=new Date(month.getFullYear(),month.getMonth()+1,1);
+    const monthlyPayments=db.prepare("SELECT COALESCE(SUM(amount),0) as total FROM Payment WHERE status IN ('SUCCESS','REFUNDED') AND createdAt>=? AND createdAt<?").get(start.toISOString(),end.toISOString()) as any;
+    const candidates=db.prepare(`SELECT s.id,s.status,s.createdAt,s.currentPeriodEnd,p.price,p.billingPeriod FROM Subscription s JOIN Plan p ON p.id=s.planId WHERE s.createdAt<?`).all(end.toISOString()) as any[];
+    const activeAtDate=candidates.filter(sub=>{
+      const cancelled=cancelledAt.get(sub.id);const wasActive=sub.status==='ACTIVE'||sub.status==='PAUSED'||(sub.status==='CLOSED'&&cancelled&&new Date(cancelled)>=end);
+      return wasActive&&new Date(sub.currentPeriodEnd)>=start;
+    });
+    const monthChurn=cancellationRows.filter(row=>new Date(row.createdAt)>=start&&new Date(row.createdAt)<end).length;
+    const monthlyMrr=activeAtDate.reduce((sum,sub)=>sum+(sub.billingPeriod==='DAILY'?sub.price*30:sub.billingPeriod==='WEEKLY'?sub.price*4:sub.billingPeriod==='QUARTERLY'?Math.round(sub.price/3):sub.billingPeriod==='YEARLY'?Math.round(sub.price/12):sub.price),0);
+    return {month:month.toLocaleString('en-US',{month:'short'}),mrr:Number((monthlyMrr/100).toFixed(2)),revenue:Number((Number(monthlyPayments.total||0)/100).toFixed(2)),activeSubscribers:activeAtDate.length,churnRate:Number((monthChurn/Math.max(1,activeAtDate.length)*100).toFixed(1))};
+  });
 
   const plans = db.prepare('SELECT * FROM Plan ORDER BY price ASC').all().map((p: any) => ({
     ...p,
@@ -917,6 +1055,7 @@ app.get('/api/admin/overview', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
   res.json({
     kpis: {
       mrrCents,
+      totalRevenueCents,
       activeSubscriptions: activeSubs.length,
       pausedSubscriptions: pausedSubsCount,
       churnRatePercent: Number(((closedSubsCount / Math.max(1, allSubsCount)) * 100 + 2.4).toFixed(1)),
@@ -990,10 +1129,11 @@ app.post('/api/admin/subscriptions/:id/renew', requireAuth(['ADMIN', 'STAFF']), 
   const days = sub.billingPeriod === 'DAILY' ? 1 : sub.billingPeriod === 'WEEKLY' ? 7 : sub.billingPeriod === 'QUARTERLY' ? 90 : sub.billingPeriod === 'YEARLY' ? 365 : 30;
   const periodEnd = new Date(now.getTime() + days * 86400000);
   const subtotal = sub.price;
-  const tax = Math.round(subtotal * Number(process.env.GST_TAX_RATE_PERCENT || 18) / 100);
+  const tax = Math.round(subtotal * getTaxRatePercent() / 100);
   const invoiceId = `inv_${crypto.randomBytes(5).toString('hex')}`;
-  const invoiceNumber = `BL-${now.getUTCFullYear()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
-  const periodKey = `${now.getUTCFullYear()}-${String(now.getUTCMonth()+1).padStart(2,'0')}-renew-${crypto.randomBytes(2).toString('hex')}`;
+  const periodKey = `${now.getUTCFullYear()}-${String(now.getUTCMonth()+1).padStart(2,'0')}-${sub.id}-renewal`;
+  if(db.prepare("SELECT id FROM Invoice WHERE subscriptionId=? AND billingPeriodKey=? AND status!='CANCELLED'").get(sub.id,periodKey))return res.status(409).json({error:'A renewal invoice already exists for this subscription and billing period.'});
+  const invoiceNumber = nextInvoiceNumber(now);
   const actor = (req as any).user as SessionUser;
   const tx = db.transaction(() => {
     db.prepare(`UPDATE Subscription SET status = 'ACTIVE', currentPeriodStart = ?, currentPeriodEnd = ?, perksFrozen = 0,
@@ -1034,6 +1174,8 @@ app.get('/api/admin/customers', requireAuth(['ADMIN', 'STAFF']), (_req, res) => 
     const payments = db.prepare(`SELECT p.*, i.invoiceNumber FROM Payment p
       LEFT JOIN Invoice i ON i.id = p.invoiceId WHERE p.userId = ? ORDER BY p.createdAt DESC`).all(user.id) as any[];
     const disputes = db.prepare('SELECT * FROM CustomerDispute WHERE customerId = ? ORDER BY createdAt DESC').all(user.id);
+    const loyalty = db.prepare('SELECT availablePoints,totalEarnedPoints,redeemedPoints,expiringPoints FROM LoyaltyAccount WHERE userId=?').get(user.id) as any || {availablePoints:0,totalEarnedPoints:0,redeemedPoints:0,expiringPoints:0};
+    const loyaltyTransactions = db.prepare('SELECT id,activity,points,balanceAfter,createdAt FROM LoyaltyTransaction WHERE userId=? ORDER BY createdAt DESC LIMIT 30').all(user.id) as any[];
     const loginActivity = db.prepare(`SELECT id, country, flaggedJump, createdAt FROM LoginActivity WHERE userId = ? ORDER BY createdAt DESC LIMIT 20`).all(user.id) as any[];
     const securityActivity = db.prepare(`SELECT id, eventType, severity, resolved, createdAt FROM SecurityLog WHERE userId = ? ORDER BY createdAt DESC LIMIT 20`).all(user.id) as any[];
     const subscriptionIds = subscriptions.map((s: any) => s.id);
@@ -1045,8 +1187,8 @@ app.get('/api/admin/customers', requireAuth(['ADMIN', 'STAFF']), (_req, res) => 
     const hasOutstanding = invoices.some((i: any) => ['CONFIRMED', 'DRAFT'].includes(i.status));
     const paymentStatus = hasOverdue ? 'OVERDUE' : latestPayment?.status === 'FAILED' ? 'FAILED' : hasOutstanding ? 'PENDING' : payments.length ? 'PAID' : 'NO PAYMENTS';
     const activityDates = [user.lastLoginAt, ...subscriptions.map((s: any) => s.createdAt), ...invoices.map((i: any) => i.createdAt), ...payments.map((p: any) => p.createdAt), ...loginActivity.map((a: any) => a.createdAt), ...securityActivity.map((a: any) => a.createdAt)].filter(Boolean).sort().reverse();
-    const activity = [...loginActivity.map((a: any) => ({ ...a, kind: 'Sign in', detail: `Sign in from ${a.country}${a.flaggedJump ? ' · unusual location' : ''}` })), ...securityActivity.map((a: any) => ({ ...a, kind: 'Security', detail: `${a.eventType.replace(/_/g, ' ')} · ${a.severity}` })), ...adminActivity.map((a: any) => ({ ...a, kind: 'Subscription', detail: a.action.replace(/_/g, ' '), metadata: a.metadata }))].sort((a: any, b: any) => b.createdAt.localeCompare(a.createdAt));
-    return { ...user, isFrozen: Boolean(user.isFrozen), parentalGateOn: Boolean(user.parentalGateOn), activeSubscriptions, totalSubscriptions: subscriptions.length, totalSpendCents, paymentStatus, customerStatus: user.isFrozen ? 'RESTRICTED' : activeSubscriptions ? 'ACTIVE' : 'INACTIVE', lastActivityAt: activityDates[0] || user.createdAt, riskScore: churnScores.get(user.id) ?? 0, rewardPoints: 1240, subscriptions, invoices, payments, disputes, activity };
+    const activity = [...loginActivity.map((a: any) => ({ ...a, kind: 'Sign in', detail: `Sign in from ${a.country}${a.flaggedJump ? ' · unusual location' : ''}` })), ...securityActivity.map((a: any) => ({ ...a, kind: 'Security', detail: `${a.eventType.replace(/_/g, ' ')} · ${a.severity}` })), ...adminActivity.map((a: any) => ({ ...a, kind: 'Subscription', detail: a.action.replace(/_/g, ' '), metadata: a.metadata })), ...loyaltyTransactions.map((a:any)=>({...a,kind:'Rewards',detail:a.activity}))].sort((a: any, b: any) => b.createdAt.localeCompare(a.createdAt));
+    return { ...user, isFrozen: Boolean(user.isFrozen), parentalGateOn: Boolean(user.parentalGateOn), activeSubscriptions, totalSubscriptions: subscriptions.length, totalSpendCents, paymentStatus, customerStatus: user.isFrozen ? 'RESTRICTED' : activeSubscriptions ? 'ACTIVE' : 'INACTIVE', lastActivityAt: activityDates[0] || user.createdAt, riskScore: churnScores.get(user.id) ?? 0, rewardPoints: loyalty.availablePoints, loyalty, loyaltyTransactions, subscriptions, invoices, payments, disputes, activity };
   });
   res.json({ customers });
 });
@@ -1089,6 +1231,7 @@ app.get('/api/admin/billing', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
     LEFT JOIN Subscription s ON s.id = i.subscriptionId LEFT JOIN Plan p ON p.id = s.planId
     ORDER BY i.createdAt DESC`).all().map((invoice: any) => ({
       ...invoice,
+      lineItems: db.prepare('SELECT id,productId,description,quantity,unitPrice,totalAmount FROM InvoiceLineItem WHERE invoiceId=? ORDER BY rowid').all(invoice.id),
       lastSentAt: (db.prepare(`SELECT createdAt FROM AuditLog WHERE entityType = 'Invoice' AND entityId = ? AND action = 'SEND_INVOICE' ORDER BY createdAt DESC LIMIT 1`).get(invoice.id) as any)?.createdAt || null,
     }));
   const payments = db.prepare(`SELECT p.*, u.name as customerName, u.email as customerEmail, i.invoiceNumber
@@ -1416,7 +1559,7 @@ app.get('/api/intelligence/revenue-forecast', requireAuth(['ADMIN', 'STAFF']), (
   const retentionDiscount = db.prepare(`SELECT value,type FROM Discount WHERE code = 'RETENTION15' AND isActive = 1`).get() as any;
   const events:any[]=[];
   const horizonEnd = new Date(now.getFullYear()+1,now.getMonth()+1,1);
-  const taxRate = Number(process.env.GST_TAX_RATE_PERCENT || 18);
+  const taxRate = getTaxRatePercent();
   const intervalDays:Record<string,number>={DAILY:1,WEEKLY:7,MONTHLY:30,QUARTERLY:90,YEARLY:365};
   for (const sub of active) {
     let due = new Date(sub.currentPeriodEnd);
@@ -1511,7 +1654,7 @@ function businessReportData(startValue?: string, endValue?: string) {
   const deltaCents = actualRevenueCents-previousRevenueCents; const deltaPercent = previousRevenueCents ? deltaCents/Math.abs(previousRevenueCents)*100 : null;
   const activeSubscriptions = db.prepare(`SELECT s.id,s.userId,s.currentPeriodEnd,p.name as planName,p.price,p.billingPeriod,u.name as customerName,u.email as customerEmail FROM Subscription s JOIN Plan p ON p.id=s.planId JOIN User u ON u.id=s.userId WHERE s.status='ACTIVE'`).all() as any[];
   const mrrCents = activeSubscriptions.reduce((sum,sub)=>sum+(sub.billingPeriod==='DAILY'?sub.price*30:sub.billingPeriod==='WEEKLY'?sub.price*4:sub.billingPeriod==='QUARTERLY'?Math.round(sub.price/3):sub.billingPeriod==='YEARLY'?Math.round(sub.price/12):sub.price),0);
-  const upcoming = activeSubscriptions.filter(sub=>new Date(sub.currentPeriodEnd)>=now&&new Date(sub.currentPeriodEnd)<=new Date(now.getTime()+30*86400000)).map(sub=>({...sub,renewalValueCents:sub.price+Math.round(sub.price*Number(process.env.GST_TAX_RATE_PERCENT||18)/100)}));
+  const upcoming = activeSubscriptions.filter(sub=>new Date(sub.currentPeriodEnd)>=now&&new Date(sub.currentPeriodEnd)<=new Date(now.getTime()+30*86400000)).map(sub=>({...sub,renewalValueCents:sub.price+Math.round(sub.price*getTaxRatePercent()/100)}));
   const unpaidInvoices = db.prepare(`SELECT i.*,u.name as customerName,u.email as customerEmail,p.name as planName FROM Invoice i JOIN User u ON u.id=i.userId LEFT JOIN Subscription s ON s.id=i.subscriptionId LEFT JOIN Plan p ON p.id=s.planId WHERE i.status IN ('CONFIRMED','OVERDUE') ORDER BY i.dueDate ASC`).all() as any[];
   const overdueInvoices = unpaidInvoices.filter(inv=>new Date(inv.dueDate)<now);
   const followups = db.prepare(`SELECT entityId,metadata,createdAt FROM AuditLog WHERE action='COLLECTION_FOLLOW_UP' AND entityType='Invoice' ORDER BY createdAt DESC`).all() as any[];
@@ -1553,7 +1696,7 @@ app.post('/api/intelligence/business-report/query', requireAuth(['ADMIN','STAFF'
   if(/overdue|late payment|collection/.test(normalized)) result={title:'Overdue customers',summary:`${report.collectionPriorities.length} customers have overdue invoices totaling ${new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(report.overdueCents/100)}.`,metrics:[{label:'Overdue balance',amountCents:report.overdueCents},{label:'Customers',count:report.collectionPriorities.length}],records:report.collectionPriorities.slice(0,20).map(row=>({customer:row.customerName,email:row.customerEmail,amountCents:row.outstandingCents,daysOverdue:row.daysOverdue,priority:row.priority,followUps:row.previousFollowUps})),availabilityNote:'Days overdue use invoice due dates and the current date.'};
   if(/expir|renew/.test(normalized)) result={title:'Upcoming subscriptions',summary:`${report.upcomingRenewals.length} active subscriptions renew within 30 days, with scheduled invoice value of ${new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(report.upcomingRenewals.reduce((sum:number,row:any)=>sum+row.renewalValueCents,0)/100)}.`,metrics:[{label:'Renewing subscriptions',count:report.upcomingRenewals.length},{label:'Scheduled value',amountCents:report.upcomingRenewals.reduce((sum:number,row:any)=>sum+row.renewalValueCents,0)}],records:report.upcomingRenewals.map((row:any)=>({customer:row.customerName,plan:row.planName,renewalDate:row.currentPeriodEnd,amountCents:row.renewalValueCents})),availabilityNote:'Renewals use current active subscription period-end dates and plan prices.'};
   if(/cancel|churn|likely to leave/.test(normalized)) result={title:'Customers at risk of cancellation',summary:`${report.churn.high} customers are in the high-risk group and ${report.churn.medium} are in the medium-risk group. These are simulated rule-based scores, not measured cancellation outcomes.`,metrics:[{label:'High risk',count:report.churn.high},{label:'Medium risk',count:report.churn.medium}],records:report.churn.highRiskCustomers,availabilityNote:'Risk uses available payments, pauses, expiry, and account activity. No trained churn model is connected.'};
-  if(/los|leak/.test(normalized)) result={title:'Revenue leakage findings',summary:`The leakage detector currently reports ${report.leakage.count} open findings with deduplicated exposure of ${new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(report.leakage.totalCents/100)}.`,metrics:[{label:'Open findings',count:report.leakage.count},{label:'Deduplicated exposure',amountCents:report.leakage.totalCents}],records:report.leakage.issues.map((issue:any)=>({issue:issue.title,customer:issue.customerName,amountCents:issue.financialImpactCents,severity:issue.severity})),availabilityNote:'Product quantity and add-on line-item checks are unavailable because those records are not stored.'};
+  if(/los|leak/.test(normalized)) result={title:'Revenue leakage findings',summary:`The leakage detector currently reports ${report.leakage.count} open findings with deduplicated exposure of ${new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(report.leakage.totalCents/100)}.`,metrics:[{label:'Open findings',count:report.leakage.count},{label:'Deduplicated exposure',amountCents:report.leakage.totalCents}],records:report.leakage.issues.map((issue:any)=>({issue:issue.title,customer:issue.customerName,amountCents:issue.financialImpactCents,severity:issue.severity})),availabilityNote:'Purchased add-ons are recorded as invoice lines. The app does not store separate cart intent, so it cannot infer optional items that a customer never selected.'};
   if(/why.*(decreas|down)|decreas|declin/.test(normalized)) result={title:'Revenue change analysis',summary:report.revenue.previousRevenueCents===0?'A previous comparable payment period has no recorded revenue baseline, so a decrease cannot be established.':`Net recorded revenue changed by ${new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(report.revenue.deltaCents/100)} (${report.revenue.deltaPercent?.toFixed(1)}%) versus the previous comparable period.`,metrics:[{label:'Selected period',amountCents:report.revenue.actualRevenueCents},{label:'Previous period',amountCents:report.revenue.previousRevenueCents},{label:'Change',amountCents:report.revenue.deltaCents}],records:[],availabilityNote:'Available data explains the change at payment and invoice level, but does not attribute it to product usage or external causes.'};
   res.json({question:query,...result,generatedAt:new Date().toISOString()});
 });
@@ -1731,7 +1874,7 @@ app.post('/api/admin/reset-seed', requireAuth(['ADMIN', 'STAFF']), (_req, res) =
 // --- VITE MIDDLEWARE & STATIC SERVING ---
 
 async function startServer() {
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT || 3000);
 
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
