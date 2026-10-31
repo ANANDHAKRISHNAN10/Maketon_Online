@@ -1,138 +1,276 @@
-datasource db {
-  provider = "sqlite"
-  url      = "file:./dev.db"
-}
+// Brightloop Gaming - Prisma Schema
+// Compatible with SQLite (local development) and PostgreSQL (production)
+// All monetary values are stored in integer minor units (cents, e.g., 4999 = $49.99)
 
 generator client {
   provider = "prisma-client-js"
 }
 
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  STAFF
+  GAMER
+}
+
+enum BillingPeriod {
+  DAILY
+  WEEKLY
+  MONTHLY
+  YEARLY
+}
+
+enum SubscriptionStatus {
+  DRAFT
+  QUOTATION
+  CONFIRMED
+  ACTIVE
+  PAUSED
+  CLOSED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  CONFIRMED
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CREDIT_CARD
+  UPI
+  WALLET
+}
+
+enum PaymentStatus {
+  SUCCESS
+  FAILED
+  CHARGEBACK
+}
+
+enum DiscountType {
+  PERCENT
+  FIXED
+}
+
+enum SecurityEventType {
+  GEO_IP_JUMP
+  CARD_BOT_ATTACK
+  REVENUE_LEAKAGE
+}
+
 model User {
-  id              String        @id @default(cuid())
-  email           String        @unique
-  passwordHash    String        @default("hashed_password_sample")
-  role            String        @default("GAMER") // ADMIN, STAFF, GAMER
+  id              String         @id @default(cuid())
+  name            String
+  email           String         @unique
+  passwordHash    String
+  role            Role           @default(GAMER)
   parentEmail     String?
   parentalPinHash String?
+  parentalGateOn  Boolean        @default(false)
   lastLoginIp     String?
-  isFrozen        Boolean       @default(false)
-  createdAt       DateTime      @default(now())
+  lastLoginCountry String?
+  lastLoginAt     DateTime?
+  isFrozen        Boolean        @default(false)
+  tradeLockUntil  DateTime?
+  createdAt       DateTime       @default(now())
 
-  // Relations
   subscriptions   Subscription[]
   invoices        Invoice[]
+  payments        Payment[]
   securityLogs    SecurityLog[]
+  loginActivities LoginActivity[]
+  auditLogs       AuditLog[]
+
+  @@index([email])
+  @@index([role])
 }
 
 model Product {
   id          String           @id @default(cuid())
   name        String
-  description String?
-  basePrice   Float
-  costPrice   Float
+  description String
+  category    String           @default("Game Pass Add-on")
+  basePrice   Int              // Minor units (cents)
+  costPrice   Int              // Minor units (cents)
   isActive    Boolean          @default(true)
   createdAt   DateTime         @default(now())
 
-  // Relations
   variants    ProductVariant[]
 }
 
 model ProductVariant {
-  id              String   @id @default(cuid())
+  id              String  @id @default(cuid())
   productId       String
-  name            String   // Standard, Pro Gamer Edition, Odoo Pass
-  priceAdjustment Float    @default(0.0)
-  createdAt       DateTime @default(now())
+  name            String
+  priceAdjustment Int     // Minor units (cents)
 
-  // Relations
-  product         Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  product         Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
 }
 
 model Plan {
   id            String         @id @default(cuid())
-  name          String
-  billingPeriod String         // DAILY, WEEKLY, MONTHLY, YEARLY
-  price         Float
+  name          String         @unique
+  tagline       String
+  billingPeriod BillingPeriod
+  price         Int            // Minor units (cents)
+  costPrice     Int            @default(0) // Minor units (cents) for margin simulations
+  perksJson     String         // JSON array of perk strings
+  badge         String?
+  isRecommended Boolean        @default(false)
   autoClose     Boolean        @default(false)
   allowPause    Boolean        @default(true)
-  maxPauseDays  Int            @default(14)
+  maxPauseDays  Int            @default(30)
   createdAt     DateTime       @default(now())
 
-  // Relations
   subscriptions Subscription[]
 }
 
 model Subscription {
-  id                 String    @id @default(cuid())
+  id                 String             @id @default(cuid())
   userId             String
   planId             String
-  status             String    @default("ACTIVE") // DRAFT, QUOTATION, CONFIRMED, ACTIVE, PAUSED, CLOSED
-  currentPeriodStart DateTime  @default(now())
+  status             SubscriptionStatus @default(ACTIVE)
+  currentPeriodStart DateTime
   currentPeriodEnd   DateTime
   pauseStartDate     DateTime?
   pauseResumeDate    DateTime?
-  createdAt          DateTime  @default(now())
-  updatedAt          DateTime  @updatedAt
+  pausedDaysPlanned  Int?
+  perksFrozen        Boolean            @default(false)
+  retentionPromoCode String?
+  createdAt          DateTime           @default(now())
 
-  // Relations
-  user               User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  plan               Plan      @relation(fields: [planId], references: [id], onDelete: Restrict)
+  user               User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan               Plan               @relation(fields: [planId], references: [id])
   invoices           Invoice[]
+  pauseHistory       PauseHistory[]
+
+  @@index([userId])
+  @@index([planId])
+  @@index([status])
 }
 
 model Invoice {
-  id             String    @id @default(cuid())
-  subscriptionId String?
-  userId         String
-  amountSubtotal Float
-  taxAmount      Float     // 18% GST
-  discountAmount Float     @default(0.0)
-  totalAmount    Float
-  status         String    @default("CONFIRMED") // DRAFT, CONFIRMED, PAID, OVERDUE, CANCELLED
-  dueDate        DateTime
-  createdAt      DateTime  @default(now())
+  id               String        @id @default(cuid())
+  invoiceNumber    String        @unique
+  subscriptionId   String
+  userId           String
+  billingPeriodKey String        // e.g. "2026-10" to enforce uniqueness per subscription period
+  amountSubtotal   Int           // Minor units (cents)
+  taxAmount        Int           // 18% GST in cents
+  discountAmount   Int           @default(0)
+  discountCode     String?
+  totalAmount      Int           // Minor units (cents)
+  status           InvoiceStatus @default(DRAFT)
+  dueDate          DateTime
+  createdAt        DateTime      @default(now())
 
-  // Relations
-  subscription   Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
-  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
-  payments       Payment[]
+  subscription     Subscription  @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  user             User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  payments         Payment[]
+
+  @@index([subscriptionId, billingPeriodKey])
+  @@index([userId])
+  @@index([status])
 }
 
 model Payment {
-  id        String   @id @default(cuid())
-  invoiceId String?  // Nullable to support unlinked payments (revenue leakage scenario d)
-  amount    Float
-  method    String   @default("CREDIT_CARD") // CREDIT_CARD, UPI, WALLET
-  status    String   @default("SUCCESS") // SUCCESS, FAILED, CHARGEBACK
-  createdAt DateTime @default(now())
+  id            String        @id @default(cuid())
+  invoiceId     String?       // Optional to support unlinked payments detection
+  userId        String
+  amount        Int           // Minor units (cents)
+  method        PaymentMethod
+  status        PaymentStatus
+  referenceCode String
+  ipAddress     String?
+  createdAt     DateTime      @default(now())
 
-  // Relations
-  invoice   Invoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  invoice       Invoice?      @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+  @@index([userId])
+  @@index([status])
 }
 
 model Discount {
-  id          String   @id @default(cuid())
-  code        String   @unique
-  type        String   @default("PERCENT") // PERCENT, FIXED
-  value       Float
-  minQuantity Int      @default(1)
-  maxUses     Int      @default(100)
-  usedCount   Int      @default(0)
-  startDate   DateTime @default(now())
+  id          String       @id @default(cuid())
+  code        String       @unique
+  description String
+  type        DiscountType
+  value       Int          // Percentage (e.g. 15 for 15%) or fixed amount in cents
+  minQuantity Int          @default(1)
+  maxUses     Int          @default(100)
+  usedCount   Int          @default(0)
+  startDate   DateTime
   endDate     DateTime
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
+  isActive    Boolean      @default(true)
+  createdAt   DateTime     @default(now())
+
+  @@index([code])
 }
 
 model SecurityLog {
-  id        String   @id @default(cuid())
-  userId    String?  // Nullable for unauthenticated/bot attacks
-  ipAddress String
-  userAgent String?
-  eventType String   // GEO_IP_JUMP, CARD_BOT_ATTACK, REVENUE_LEAKAGE
-  details   String   // JSON string containing contextual attack details
-  createdAt DateTime @default(now())
+  id          String            @id @default(cuid())
+  userId      String?
+  ipAddress   String
+  userAgent   String
+  eventType   SecurityEventType
+  severity    String            @default("HIGH")
+  details     String            // JSON string
+  resolved    Boolean           @default(false)
+  createdAt   DateTime          @default(now())
 
-  // Relations
-  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  user        User?             @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([eventType])
+  @@index([ipAddress])
+}
+
+model PauseHistory {
+  id             String       @id @default(cuid())
+  subscriptionId String
+  pauseStart     DateTime
+  plannedResume  DateTime
+  actualResume   DateTime?
+  daysPaused     Int
+  reason         String?
+  createdAt      DateTime     @default(now())
+
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([subscriptionId])
+}
+
+model LoginActivity {
+  id          String   @id @default(cuid())
+  userId      String
+  ipAddress   String
+  country     String
+  userAgent   String
+  flaggedJump Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String
+  metadata   String   // JSON string
+  createdAt  DateTime @default(now())
+
+  actor      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
 }
