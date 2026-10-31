@@ -16,6 +16,7 @@ import { CustomerLoyaltyPage } from './pages/CustomerLoyaltyPage';
 import { CustomerInvoicesPage } from './pages/CustomerInvoicesPage';
 import { AdminDashboardPage } from './pages/AdminDashboardPage';
 import { AdminSubscriptionsPage } from './pages/AdminSubscriptionsPage';
+import { AdminCustomersPage } from './pages/AdminCustomersPage';
 
 function AppRoutes() {
   const { pathname } = useLocation();
@@ -44,7 +45,7 @@ function AppRoutes() {
                 <Route path="/admin/dashboard" element={<AdminDashboardPage />} />
                 <Route path="/admin/products" element={<FoundationPage />} />
                 <Route path="/admin/subscriptions" element={<AdminSubscriptionsPage />} />
-                <Route path="/admin/customers" element={<FoundationPage />} />
+                <Route path="/admin/customers" element={<AdminCustomersPage />} />
                 <Route path="/admin/billing" element={<FoundationPage />} />
                 <Route path="/admin/discounts" element={<FoundationPage />} />
                 <Route path="/admin/pause-cancellation" element={<FoundationPage />} />

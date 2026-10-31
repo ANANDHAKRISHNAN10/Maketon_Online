@@ -875,6 +875,67 @@ app.post('/api/admin/invoices/:id/approve', requireAuth(['ADMIN', 'STAFF']), (re
   res.json({ message: 'Quotation approved.', invoiceId: invoice.id });
 });
 
+// --- CUSTOMER MANAGEMENT ---
+app.get('/api/admin/customers', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
+  const userRows = db.prepare(`SELECT id, name, email, role, isFrozen, parentalGateOn, createdAt, lastLoginAt
+    FROM User WHERE role = 'GAMER' ORDER BY createdAt DESC`).all() as any[];
+  const churnScores = new Map(calculateChurnPredictions().subscribers.map((item: any) => [item.userId, item.riskScore]));
+  const customers = userRows.map((user: any) => {
+    const subscriptions = db.prepare(`SELECT s.*, p.name as planName, p.billingPeriod, p.price as planPrice
+      FROM Subscription s JOIN Plan p ON p.id = s.planId WHERE s.userId = ? ORDER BY s.createdAt DESC`).all(user.id) as any[];
+    const invoices = db.prepare(`SELECT i.*, p.name as planName FROM Invoice i
+      LEFT JOIN Subscription s ON s.id = i.subscriptionId LEFT JOIN Plan p ON p.id = s.planId
+      WHERE i.userId = ? ORDER BY i.createdAt DESC`).all(user.id) as any[];
+    const payments = db.prepare(`SELECT p.*, i.invoiceNumber FROM Payment p
+      LEFT JOIN Invoice i ON i.id = p.invoiceId WHERE p.userId = ? ORDER BY p.createdAt DESC`).all(user.id) as any[];
+    const disputes = db.prepare('SELECT * FROM CustomerDispute WHERE customerId = ? ORDER BY createdAt DESC').all(user.id);
+    const loginActivity = db.prepare(`SELECT id, country, flaggedJump, createdAt FROM LoginActivity WHERE userId = ? ORDER BY createdAt DESC LIMIT 20`).all(user.id) as any[];
+    const securityActivity = db.prepare(`SELECT id, eventType, severity, resolved, createdAt FROM SecurityLog WHERE userId = ? ORDER BY createdAt DESC LIMIT 20`).all(user.id) as any[];
+    const subscriptionIds = subscriptions.map((s: any) => s.id);
+    const adminActivity = subscriptionIds.flatMap((id: string) => db.prepare(`SELECT id, action, metadata, createdAt FROM AuditLog WHERE entityId = ? ORDER BY createdAt DESC LIMIT 20`).all(id) as any[]);
+    const activeSubscriptions = subscriptions.filter((s: any) => s.status === 'ACTIVE').length;
+    const totalSpendCents = payments.filter((p: any) => ['SUCCESS', 'SUCCEEDED'].includes(String(p.status).toUpperCase())).reduce((sum: number, p: any) => sum + Number(p.amount || 0), 0);
+    const latestPayment = payments[0];
+    const hasOverdue = invoices.some((i: any) => i.status === 'OVERDUE');
+    const hasOutstanding = invoices.some((i: any) => ['CONFIRMED', 'DRAFT'].includes(i.status));
+    const paymentStatus = hasOverdue ? 'OVERDUE' : latestPayment?.status === 'FAILED' ? 'FAILED' : hasOutstanding ? 'PENDING' : payments.length ? 'PAID' : 'NO PAYMENTS';
+    const activityDates = [user.lastLoginAt, ...subscriptions.map((s: any) => s.createdAt), ...invoices.map((i: any) => i.createdAt), ...payments.map((p: any) => p.createdAt), ...loginActivity.map((a: any) => a.createdAt), ...securityActivity.map((a: any) => a.createdAt)].filter(Boolean).sort().reverse();
+    const activity = [...loginActivity.map((a: any) => ({ ...a, kind: 'Sign in', detail: `Sign in from ${a.country}${a.flaggedJump ? ' · unusual location' : ''}` })), ...securityActivity.map((a: any) => ({ ...a, kind: 'Security', detail: `${a.eventType.replace(/_/g, ' ')} · ${a.severity}` })), ...adminActivity.map((a: any) => ({ ...a, kind: 'Subscription', detail: a.action.replace(/_/g, ' '), metadata: a.metadata }))].sort((a: any, b: any) => b.createdAt.localeCompare(a.createdAt));
+    return { ...user, isFrozen: Boolean(user.isFrozen), parentalGateOn: Boolean(user.parentalGateOn), activeSubscriptions, totalSubscriptions: subscriptions.length, totalSpendCents, paymentStatus, customerStatus: user.isFrozen ? 'RESTRICTED' : activeSubscriptions ? 'ACTIVE' : 'INACTIVE', lastActivityAt: activityDates[0] || user.createdAt, riskScore: churnScores.get(user.id) ?? 0, rewardPoints: 1240, subscriptions, invoices, payments, disputes, activity };
+  });
+  res.json({ customers });
+});
+
+app.post('/api/admin/customers/:id/disputes', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
+  const customer = db.prepare(`SELECT id FROM User WHERE id = ? AND role = 'GAMER'`).get(req.params.id);
+  if (!customer) return res.status(404).json({ error: 'Customer not found.' });
+  const subject = String(req.body?.subject || '').trim();
+  const description = String(req.body?.description || '').trim();
+  const priority = ['LOW', 'NORMAL', 'HIGH'].includes(String(req.body?.priority).toUpperCase()) ? String(req.body.priority).toUpperCase() : 'NORMAL';
+  if (subject.length < 3 || description.length < 8) return res.status(400).json({ error: 'Add a short subject and at least 8 characters of detail.' });
+  const id = `dis_${crypto.randomBytes(5).toString('hex')}`;
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO CustomerDispute (id, customerId, subject, description, priority, status, createdAt, updatedAt)
+    VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?)`).run(id, req.params.id, subject, description, priority, now, now);
+  const actor = (req as any).user as SessionUser;
+  db.prepare(`INSERT INTO AuditLog (id, actorId, action, entityType, entityId, metadata, createdAt)
+    VALUES (?, ?, 'CREATE_CUSTOMER_DISPUTE', 'Customer', ?, ?, ?)`).run(`aud_${crypto.randomBytes(5).toString('hex')}`, actor.id, req.params.id, JSON.stringify({ disputeId: id, subject, priority }), now);
+  res.status(201).json({ message: 'Customer dispute recorded.', disputeId: id });
+});
+
+app.put('/api/admin/disputes/:id', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
+  const status = String(req.body?.status || '').toUpperCase();
+  if (!['OPEN', 'IN_REVIEW', 'RESOLVED'].includes(status)) return res.status(400).json({ error: 'Choose Open, In review, or Resolved.' });
+  const dispute = db.prepare('SELECT * FROM CustomerDispute WHERE id = ?').get(req.params.id) as any;
+  if (!dispute) return res.status(404).json({ error: 'Dispute not found.' });
+  const now = new Date().toISOString();
+  db.prepare('UPDATE CustomerDispute SET status = ?, updatedAt = ?, resolvedAt = ? WHERE id = ?').run(status, now, status === 'RESOLVED' ? now : null, dispute.id);
+  const actor = (req as any).user as SessionUser;
+  db.prepare(`INSERT INTO AuditLog (id, actorId, action, entityType, entityId, metadata, createdAt)
+    VALUES (?, ?, 'UPDATE_CUSTOMER_DISPUTE', 'Customer', ?, ?, ?)`).run(`aud_${crypto.randomBytes(5).toString('hex')}`, actor.id, dispute.customerId, JSON.stringify({ disputeId: dispute.id, status }), now);
+  res.json({ message: 'Dispute status updated.', status });
+});
+
 // Plan CRUD
 app.post('/api/admin/plans', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
   const parsed = PlanInputSchema.safeParse(req.body);

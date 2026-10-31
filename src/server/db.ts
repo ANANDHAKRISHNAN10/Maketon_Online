@@ -182,6 +182,19 @@ export function initDatabase() {
       FOREIGN KEY (actorId) REFERENCES User(id) ON DELETE SET NULL
     );
 
+    CREATE TABLE IF NOT EXISTS CustomerDispute (
+      id TEXT PRIMARY KEY,
+      customerId TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      description TEXT NOT NULL,
+      priority TEXT NOT NULL DEFAULT 'NORMAL',
+      status TEXT NOT NULL DEFAULT 'OPEN',
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL,
+      resolvedAt TEXT,
+      FOREIGN KEY (customerId) REFERENCES User(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS IpBlocklist (
       ipAddress TEXT PRIMARY KEY,
       failedAttempts INTEGER NOT NULL DEFAULT 0,
@@ -197,6 +210,7 @@ export function seedDatabase(forceReset = false) {
 
   if (forceReset) {
     db.exec(`
+      DELETE FROM CustomerDispute;
       DELETE FROM AuditLog;
       DELETE FROM LoginActivity;
       DELETE FROM PauseHistory;
