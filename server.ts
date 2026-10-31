@@ -330,7 +330,11 @@ app.get('/api/gamer/dashboard', requireAuth(['GAMER', 'ADMIN', 'STAFF']), (req, 
   `).get(targetUserId) as any;
 
   const invoices = db.prepare(`
-    SELECT * FROM Invoice WHERE userId = ? ORDER BY createdAt DESC
+    SELECT i.*, p.name as planName
+    FROM Invoice i
+    LEFT JOIN Subscription s ON s.id = i.subscriptionId
+    LEFT JOIN Plan p ON p.id = s.planId
+    WHERE i.userId = ? ORDER BY i.createdAt DESC
   `).all(targetUserId);
 
   const payments = db.prepare(`
