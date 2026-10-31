@@ -12,6 +12,7 @@ import { AppShell } from './components/layout/AppShell';
 import { FoundationPage } from './pages/FoundationPage';
 import { CheckoutPage } from './pages/CheckoutPage';
 import { LandingPlansPage } from './pages/PublicHome';
+import { CustomerLoyaltyPage } from './pages/CustomerLoyaltyPage';
 
 function AppRoutes() {
   const { pathname } = useLocation();
@@ -33,7 +34,7 @@ function AppRoutes() {
               <Route element={<AppShell />}>
                 <Route path="/customer/dashboard" element={<FoundationPage />} />
                 <Route path="/customer/subscriptions" element={<FoundationPage />} />
-                <Route path="/customer/loyalty" element={<FoundationPage />} />
+                <Route path="/customer/loyalty" element={<CustomerLoyaltyPage />} />
                 <Route path="/customer/invoices" element={<FoundationPage />} />
                 <Route path="/customer/payments" element={<FoundationPage />} />
                 <Route path="/customer/security" element={<FoundationPage />} />
