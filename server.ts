@@ -52,12 +52,15 @@ function getAuthUser(req: Request): SessionUser | null {
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.slice(7).trim();
     if (sessions.has(token)) {
-      return sessions.get(token)!;
+      const session = sessions.get(token)!;
+      const current = db.prepare('SELECT id, name, email, role, isActive FROM User WHERE id = ?').get(session.id) as any;
+      if (!current || current.isActive === 0) { sessions.delete(token); return null; }
+      return { id: current.id, name: current.name, email: current.email, role: current.role };
     }
     // Support deterministic demo switcher header for seamless testing across roles if token was from previous reload
     if (token.startsWith('demo_user_')) {
       const userId = token.replace('demo_user_', '');
-      const row = db.prepare('SELECT id, name, email, role FROM User WHERE id = ?').get(userId) as SessionUser | undefined;
+      const row = db.prepare('SELECT id, name, email, role FROM User WHERE id = ? AND isActive = 1').get(userId) as SessionUser | undefined;
       if (row) return row;
     }
   }
@@ -198,6 +201,7 @@ app.post('/api/auth/login', (req, res) => {
 
   const { email, password, simulatedCountry } = parsed.data;
   const user = db.prepare('SELECT * FROM User WHERE email = ?').get(email.toLowerCase()) as any;
+  if (user && user.isActive === 0) return res.status(403).json({ error: 'This staff account has been deactivated. Contact an administrator.' });
   if (!user || user.passwordHash !== hashPassword(password)) {
     if (user) {
       const nowIso = new Date().toISOString();
@@ -288,7 +292,7 @@ app.post('/api/auth/login', (req, res) => {
 
 app.post('/api/auth/quick-switch', (req, res) => {
   const { userId } = req.body;
-  const user = db.prepare('SELECT id, name, email, role FROM User WHERE id = ?').get(userId) as SessionUser | undefined;
+  const user = db.prepare('SELECT id, name, email, role FROM User WHERE id = ? AND isActive = 1').get(userId) as SessionUser | undefined;
   if (!user) {
     return res.status(404).json({ error: 'Account not found.' });
   }
@@ -718,6 +722,105 @@ app.post('/api/billing/generate-invoices', requireAuth(['ADMIN', 'STAFF']), (req
 });
 
 // --- ADMIN CONTROL CENTER APIs (SECTION 7) ---
+
+const settingsDefaults = {
+  general: { businessName: 'Brightloop Gaming', logoUrl: '', contactEmail: 'hello@brightloop.gg', contactPhone: '+1 (555) 018-2040', address: '120 Pixel Avenue, San Francisco, CA 94107', timeZone: 'America/Los_Angeles', currency: 'USD' },
+  language: { defaultLanguage: 'en', customerLanguageSelection: true, localizedNotifications: true, availableLanguages: ['en', 'ml'] },
+  billing: { defaultCycle: 'MONTHLY', taxRatePercent: 18, renewalDays: 3, invoicePrefix: 'BL', nextInvoiceNumber: 1001, paymentMethods: { card: true, upi: true, wallet: true } },
+  notifications: { renewalReminders: true, failedPaymentAlerts: true, expiryNotifications: true, fraudAlerts: true, collectionReminders: true },
+  security: { minimumPasswordLength: 8, requireUppercase: true, requireNumber: true, requireSymbol: true, twoFactorRequired: false, sessionTimeoutMinutes: 60 },
+  staffPermissions: { STAFF: ['customers.read', 'subscriptions.read', 'billing.read', 'billing.write', 'reports.read'] },
+};
+
+function readAppSettings() {
+  const rows = db.prepare('SELECT key, valueJson FROM AppSetting').all() as Array<{key:string;valueJson:string}>;
+  const saved = Object.fromEntries(rows.map(row => { try { return [row.key, JSON.parse(row.valueJson)]; } catch { return [row.key, null]; } }));
+  return Object.fromEntries(Object.entries(settingsDefaults).map(([key, value]) => [key, saved[key] && typeof saved[key] === 'object' ? { ...value, ...saved[key] } : value]));
+}
+
+function auditSetting(actorId: string, action: string, entityId: string, metadata: unknown) {
+  db.prepare('INSERT INTO AuditLog (id,actorId,action,entityType,entityId,metadata,createdAt) VALUES (?,?,?,?,?,?,?)')
+    .run(`aud_${crypto.randomBytes(6).toString('hex')}`, actorId, action, 'Settings', entityId, JSON.stringify(metadata), new Date().toISOString());
+}
+
+app.get('/api/admin/settings', requireAuth(['ADMIN']), (req, res) => {
+  const staff = db.prepare(`SELECT id,name,email,role,staffRole,isActive,permissionsJson,createdAt,lastLoginAt FROM User WHERE role='STAFF' ORDER BY name`).all().map((row: any) => ({ ...row, isActive: Boolean(row.isActive), permissions: JSON.parse(row.permissionsJson || '[]') }));
+  const auditLogs = db.prepare(`SELECT a.id,a.action,a.entityType,a.entityId,a.metadata,a.createdAt,u.name AS actorName,u.email AS actorEmail FROM AuditLog a LEFT JOIN User u ON u.id=a.actorId ORDER BY a.createdAt DESC LIMIT 60`).all().map((row: any) => ({ ...row, changes: (() => { try { return JSON.parse(row.metadata || '{}'); } catch { return {}; } })() }));
+  const sessionsList = db.prepare(`SELECT l.id,l.userId,u.name,u.email,l.country,l.ipAddress,l.userAgent,l.createdAt,l.flaggedJump FROM LoginActivity l JOIN User u ON u.id=l.userId WHERE u.role IN ('ADMIN','STAFF') ORDER BY l.createdAt DESC LIMIT 30`).all();
+  res.json({ settings: readAppSettings(), staff, auditLogs, sessions: sessionsList });
+});
+
+app.put('/api/admin/settings', requireAuth(['ADMIN']), (req, res) => {
+  const actor = (req as any).user as SessionUser;
+  const next = req.body?.settings;
+  if (!next || typeof next !== 'object' || Array.isArray(next)) return res.status(400).json({ error: 'Settings payload is required.' });
+  const current = readAppSettings();
+  const validKeys = Object.keys(settingsDefaults);
+  for (const key of validKeys) {
+    if (next[key] === undefined || typeof next[key] !== 'object' || Array.isArray(next[key])) return res.status(400).json({ error: `The ${key} settings are incomplete.` });
+  }
+  const security = next.security;
+  if (!Number.isInteger(Number(security.minimumPasswordLength)) || Number(security.minimumPasswordLength) < 8 || Number(security.minimumPasswordLength) > 64) return res.status(400).json({ error: 'Password length must be between 8 and 64 characters.' });
+  if (!Number.isFinite(Number(next.billing.taxRatePercent)) || Number(next.billing.taxRatePercent) < 0 || Number(next.billing.taxRatePercent) > 100) return res.status(400).json({ error: 'Tax rate must be between 0 and 100 percent.' });
+  const safe = Object.fromEntries(validKeys.map(key => [key, { ...(current as any)[key], ...next[key] }]));
+  const now = new Date().toISOString();
+  const write = db.prepare('INSERT INTO AppSetting(key,valueJson,updatedAt,updatedBy) VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET valueJson=excluded.valueJson,updatedAt=excluded.updatedAt,updatedBy=excluded.updatedBy');
+  const tx = db.transaction(() => {
+    for (const key of validKeys) write.run(key, JSON.stringify((safe as any)[key]), now, actor.id);
+    auditSetting(actor.id, 'UPDATE_SETTINGS', 'workspace', { sections: validKeys });
+  });
+  tx();
+  res.json({ settings: readAppSettings(), message: 'Settings saved to the workspace.' });
+});
+
+app.post('/api/admin/staff', requireAuth(['ADMIN']), (req, res) => {
+  const actor = (req as any).user as SessionUser;
+  const { name, email, password, permissions, staffRole } = req.body || {};
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  if (String(name || '').trim().length < 2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) return res.status(400).json({ error: 'Enter a staff name and valid email address.' });
+  const settings = readAppSettings();
+  const security = settings.security as any;
+  const secret = String(password || '');
+  const policyOk = secret.length >= Number(security.minimumPasswordLength) && (!security.requireUppercase || /[A-Z]/.test(secret)) && (!security.requireNumber || /\d/.test(secret)) && (!security.requireSymbol || /[^A-Za-z0-9]/.test(secret));
+  if (!policyOk) return res.status(400).json({ error: 'Password does not meet the current security policy.' });
+  if (db.prepare('SELECT id FROM User WHERE email=?').get(normalizedEmail)) return res.status(409).json({ error: 'An account with this email already exists.' });
+  const id = `usr_staff_${crypto.randomBytes(6).toString('hex')}`;
+  const allowed = ((settings.staffPermissions as any).STAFF || []) as string[];
+  const selected = Array.isArray(permissions) ? permissions.filter((item: unknown) => typeof item === 'string' && allowed.includes(item)) : allowed;
+  const title = ['Operations','Billing','Support','Security'].includes(staffRole) ? staffRole : 'Operations';
+  db.prepare(`INSERT INTO User (id,name,email,passwordHash,role,staffRole,createdAt,permissionsJson) VALUES (?,?,?,?, 'STAFF',?,?,?)`).run(id, String(name).trim(), normalizedEmail, hashPassword(secret), title, new Date().toISOString(), JSON.stringify(selected));
+  auditSetting(actor.id, 'CREATE_STAFF_ACCOUNT', id, { name: String(name).trim(), email: normalizedEmail, staffRole: title });
+  res.status(201).json({ message: 'Staff account created.', staff: { id, name: String(name).trim(), email: normalizedEmail, role: 'STAFF', staffRole: title, isActive: true, permissions: selected } });
+});
+
+app.put('/api/admin/staff/:id', requireAuth(['ADMIN']), (req, res) => {
+  const actor = (req as any).user as SessionUser;
+  const existing = db.prepare("SELECT id,name,email,role,staffRole,isActive,permissionsJson FROM User WHERE id=? AND role='STAFF'").get(req.params.id) as any;
+  if (!existing) return res.status(404).json({ error: 'Staff account not found.' });
+  const { name, email, permissions, isActive, staffRole } = req.body || {};
+  const newName = name === undefined ? existing.name : String(name).trim();
+  const newEmail = email === undefined ? existing.email : String(email).trim().toLowerCase();
+  if (newName.length < 2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) return res.status(400).json({ error: 'Enter a staff name and valid email address.' });
+  if (db.prepare('SELECT id FROM User WHERE email=? AND id<>?').get(newEmail, existing.id)) return res.status(409).json({ error: 'That email is already assigned to another account.' });
+  const settings = readAppSettings(); const allowed = ((settings.staffPermissions as any).STAFF || []) as string[];
+  const selected = Array.isArray(permissions) ? permissions.filter((item: unknown) => typeof item === 'string' && allowed.includes(item)) : JSON.parse(existing.permissionsJson || '[]');
+  const active = isActive === undefined ? Boolean(existing.isActive) : Boolean(isActive);
+  const title = staffRole === undefined ? existing.staffRole : (['Operations','Billing','Support','Security'].includes(staffRole) ? staffRole : existing.staffRole);
+  db.prepare('UPDATE User SET name=?,email=?,isActive=?,permissionsJson=?,staffRole=? WHERE id=?').run(newName,newEmail,active?1:0,JSON.stringify(selected),title,existing.id);
+  if (!active || newEmail !== existing.email) for (const [token, session] of sessions.entries()) if (session.id === existing.id) sessions.delete(token);
+  auditSetting(actor.id, 'UPDATE_STAFF_ACCOUNT', existing.id, { name: newName, email: newEmail, isActive: active, permissions: selected });
+  res.json({ message: active ? 'Staff account updated.' : 'Staff account deactivated and signed out.', staff: { id: existing.id, name: newName, email: newEmail, role: 'STAFF', staffRole: title, isActive: active, permissions: selected } });
+});
+
+app.post('/api/admin/sessions/:userId/revoke', requireAuth(['ADMIN']), (req, res) => {
+  const actor = (req as any).user as SessionUser;
+  const target = db.prepare("SELECT id,name,role FROM User WHERE id=? AND role IN ('ADMIN','STAFF')").get(req.params.userId) as any;
+  if (!target) return res.status(404).json({ error: 'Workspace account not found.' });
+  let revoked = 0;
+  for (const [token, session] of sessions.entries()) if (session.id === target.id) { sessions.delete(token); revoked++; }
+  auditSetting(actor.id, 'REVOKE_STAFF_SESSIONS', target.id, { revokedSessions: revoked });
+  res.json({ message: `Revoked ${revoked} active session${revoked === 1 ? '' : 's'} for ${target.name}.`, revoked });
+});
 
 app.get('/api/admin/overview', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
   const activeSubs = db.prepare(`

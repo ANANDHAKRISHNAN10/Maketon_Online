@@ -32,6 +32,9 @@ export function initDatabase() {
       lastLoginCountry TEXT,
       lastLoginAt TEXT,
       isFrozen INTEGER NOT NULL DEFAULT 0,
+      isActive INTEGER NOT NULL DEFAULT 1,
+      permissionsJson TEXT NOT NULL DEFAULT '[]',
+      staffRole TEXT NOT NULL DEFAULT 'Operations',
       tradeLockUntil TEXT,
       createdAt TEXT NOT NULL
     );
@@ -186,6 +189,13 @@ export function initDatabase() {
       FOREIGN KEY (actorId) REFERENCES User(id) ON DELETE SET NULL
     );
 
+    CREATE TABLE IF NOT EXISTS AppSetting (
+      key TEXT PRIMARY KEY,
+      valueJson TEXT NOT NULL,
+      updatedAt TEXT NOT NULL,
+      updatedBy TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS CustomerDispute (
       id TEXT PRIMARY KEY,
       customerId TEXT NOT NULL,
@@ -209,6 +219,10 @@ export function initDatabase() {
   `);
 
   const discountColumns = new Set((db.prepare('PRAGMA table_info(Discount)').all() as Array<{ name: string }>).map(column => column.name));
+  const userColumns = new Set((db.prepare('PRAGMA table_info(User)').all() as Array<{ name: string }>).map(column => column.name));
+  if (!userColumns.has('isActive')) db.exec('ALTER TABLE User ADD COLUMN isActive INTEGER NOT NULL DEFAULT 1');
+  if (!userColumns.has('permissionsJson')) db.exec("ALTER TABLE User ADD COLUMN permissionsJson TEXT NOT NULL DEFAULT '[]'");
+  if (!userColumns.has('staffRole')) db.exec("ALTER TABLE User ADD COLUMN staffRole TEXT NOT NULL DEFAULT 'Operations'");
   if (!discountColumns.has('minPurchaseCents')) db.exec('ALTER TABLE Discount ADD COLUMN minPurchaseCents INTEGER NOT NULL DEFAULT 0');
   if (!discountColumns.has('productIdsJson')) db.exec("ALTER TABLE Discount ADD COLUMN productIdsJson TEXT NOT NULL DEFAULT '[]'");
   if (!discountColumns.has('planIdsJson')) db.exec("ALTER TABLE Discount ADD COLUMN planIdsJson TEXT NOT NULL DEFAULT '[]'");

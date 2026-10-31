@@ -23,6 +23,7 @@ import { AdminChurnPage } from './pages/AdminChurnPage';
 import { AdminRevenueLeakagePage } from './pages/AdminRevenueLeakagePage';
 import { AdminForecastingPage } from './pages/AdminForecastingPage';
 import { AdminReportsPage } from './pages/AdminReportsPage';
+import { AdminSettingsPage } from './pages/AdminSettingsPage';
 
 function AppRoutes() {
   const { pathname } = useLocation();
@@ -64,7 +65,7 @@ function AppRoutes() {
                 <Route path="/admin/revenue-leakage" element={<AdminRevenueLeakagePage />} />
                 <Route path="/admin/forecasting" element={<AdminForecastingPage />} />
                 <Route path="/admin/reports" element={<AdminReportsPage />} />
-                <Route path="/admin/settings" element={<FoundationPage />} />
+                <Route path="/admin/settings" element={<AdminSettingsPage />} />
               </Route>
               <Route path="/plans" element={<LandingPlansPage />} />
               <Route path="/checkout" element={<CheckoutPage />} />
