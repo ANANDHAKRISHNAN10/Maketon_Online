@@ -18,6 +18,7 @@ import { AdminDashboardPage } from './pages/AdminDashboardPage';
 import { AdminSubscriptionsPage } from './pages/AdminSubscriptionsPage';
 import { AdminCustomersPage } from './pages/AdminCustomersPage';
 import { AdminBillingPage } from './pages/AdminBillingPage';
+import { AdminDiscountsPage } from './pages/AdminDiscountsPage';
 
 function AppRoutes() {
   const { pathname } = useLocation();
@@ -48,12 +49,12 @@ function AppRoutes() {
                 <Route path="/admin/subscriptions" element={<AdminSubscriptionsPage />} />
                 <Route path="/admin/customers" element={<AdminCustomersPage />} />
                 <Route path="/admin/billing" element={<AdminBillingPage />} />
-                <Route path="/admin/discounts" element={<FoundationPage />} />
+                <Route path="/admin/discounts" element={<AdminDiscountsPage />} />
                 <Route path="/admin/pause-cancellation" element={<FoundationPage />} />
                 <Route path="/admin/loyalty" element={<FoundationPage />} />
                 <Route path="/admin/invoices" element={<FoundationPage />} />
                 <Route path="/admin/payments" element={<FoundationPage />} />
-                <Route path="/admin/fraud" element={<FoundationPage />} />
+                <Route path="/admin/fraud" element={<AdminSecurityPage />} />
                 <Route path="/admin/churn" element={<FoundationPage />} />
                 <Route path="/admin/revenue-intelligence" element={<FoundationPage />} />
                 <Route path="/admin/revenue-leakage" element={<FoundationPage />} />

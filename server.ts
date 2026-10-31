@@ -435,12 +435,19 @@ app.post('/api/gamer/subscribe', requireAuth(['GAMER', 'ADMIN', 'STAFF']), (req,
   const tx = db.transaction(() => {
     let discountAmount = 0;
     let appliedCode: string | null = null;
+    const existingSub = db.prepare('SELECT * FROM Subscription WHERE userId = ? ORDER BY createdAt DESC LIMIT 1').get(user.id) as any;
 
     if (discountCode) {
       const d = db.prepare('SELECT * FROM Discount WHERE code = ?').get(discountCode.toUpperCase()) as any;
-      if (!d || !d.isActive || new Date(d.endDate) < now || d.usedCount >= d.maxUses) {
+      if (!d || !d.isActive || new Date(d.endDate) < now || new Date(d.startDate) > now || d.usedCount >= d.maxUses) {
         throw new Error(`Discount code "${discountCode}" is invalid, expired, or exhausted.`);
       }
+      const applicablePlans = JSON.parse(d.planIdsJson || '[]') as string[];
+      if (applicablePlans.length && !applicablePlans.includes(plan.id)) throw new Error('This discount is not valid for the selected plan.');
+      if (plan.price < Number(d.minPurchaseCents || 0)) throw new Error('The selected plan does not meet this discount’s minimum purchase amount.');
+      if (d.customerEligibility === 'NEW' && existingSub) throw new Error('This discount is available to new customers only.');
+      if (d.customerEligibility === 'EXISTING' && !existingSub) throw new Error('This discount is available to existing customers only.');
+      if (d.minQuantity > 1) throw new Error('This discount requires a multi item purchase and cannot be used on a single plan checkout.');
       discountAmount =
         d.type === 'PERCENT'
           ? Math.round((plan.price * d.value) / 100)
@@ -449,7 +456,6 @@ app.post('/api/gamer/subscribe', requireAuth(['GAMER', 'ADMIN', 'STAFF']), (req,
       db.prepare('UPDATE Discount SET usedCount = usedCount + 1 WHERE id = ?').run(d.id);
     }
 
-    const existingSub = db.prepare('SELECT * FROM Subscription WHERE userId = ? ORDER BY createdAt DESC LIMIT 1').get(user.id) as any;
     let subId = existingSub?.id;
 
     if (existingSub) {
@@ -738,6 +744,8 @@ app.get('/api/admin/overview', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
   const discounts = db.prepare('SELECT * FROM Discount ORDER BY createdAt DESC').all().map((d: any) => ({
     ...d,
     isActive: Boolean(d.isActive),
+    productIds: JSON.parse(d.productIdsJson || '[]'),
+    planIds: JSON.parse(d.planIdsJson || '[]'),
   }));
 
   const users = db.prepare(`
@@ -1134,8 +1142,8 @@ app.post('/api/admin/discounts', requireAuth(['ADMIN', 'STAFF']), (req, res) => 
   const id = `disc_${crypto.randomBytes(4).toString('hex')}`;
   try {
     db.prepare(`
-      INSERT INTO Discount (id, code, description, type, value, minQuantity, maxUses, usedCount, startDate, endDate, isActive, createdAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+      INSERT INTO Discount (id, code, description, type, value, minQuantity, maxUses, usedCount, minPurchaseCents, productIdsJson, planIdsJson, customerEligibility, startDate, endDate, isActive, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       d.code,
@@ -1144,6 +1152,10 @@ app.post('/api/admin/discounts', requireAuth(['ADMIN', 'STAFF']), (req, res) => 
       d.value,
       d.minQuantity,
       d.maxUses,
+      d.minPurchaseCents,
+      JSON.stringify(d.productIds),
+      JSON.stringify(d.planIds),
+      d.customerEligibility,
       d.startDate,
       d.endDate,
       d.isActive ? 1 : 0,
@@ -1158,6 +1170,14 @@ app.post('/api/admin/discounts', requireAuth(['ADMIN', 'STAFF']), (req, res) => 
 app.delete('/api/admin/discounts/:id', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
   db.prepare('DELETE FROM Discount WHERE id = ?').run(req.params.id);
   res.json({ message: 'Discount deleted.' });
+});
+
+app.put('/api/admin/discounts/:id', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
+  const existing = db.prepare('SELECT id FROM Discount WHERE id = ?').get(req.params.id);
+  if (!existing) return res.status(404).json({ error: 'Discount not found.' });
+  const isActive = Boolean(req.body?.isActive);
+  db.prepare('UPDATE Discount SET isActive = ? WHERE id = ?').run(isActive ? 1 : 0, req.params.id);
+  res.json({ message: `Discount ${isActive ? 'activated' : 'paused'}.` });
 });
 
 // --- REVENUE INTELLIGENCE & CHURN APIs (SECTIONS 9, 10, 12) ---
@@ -1266,6 +1286,9 @@ app.post('/api/security/checkout-rate-limit', (req, res) => {
 });
 
 app.get('/api/security/dashboard', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
+  const workflow = db.prepare("SELECT entityId, action FROM AuditLog WHERE entityType = 'SecurityLog' ORDER BY createdAt DESC").all() as any[];
+  const workflowById = new Map<string, string>();
+  workflow.forEach((entry) => { if (!workflowById.has(entry.entityId)) workflowById.set(entry.entityId, entry.action); });
   const logs = db.prepare(`
     SELECT s.*, u.name as userName, u.email as userEmail
     FROM SecurityLog s
@@ -1274,6 +1297,7 @@ app.get('/api/security/dashboard', requireAuth(['ADMIN', 'STAFF']), (_req, res) 
   `).all().map((l: any) => ({
     ...l,
     resolved: Boolean(l.resolved),
+    workflowStatus: l.resolved ? 'RESOLVED' : workflowById.get(l.id) === 'SECURITY_ESCALATE' ? 'ESCALATED' : workflowById.get(l.id) === 'SECURITY_REVIEW' ? 'REVIEWED' : 'OPEN',
     detailsParsed: JSON.parse(l.details || '{}'),
   }));
 
@@ -1290,12 +1314,30 @@ app.get('/api/security/dashboard', requireAuth(['ADMIN', 'STAFF']), (_req, res) 
     ORDER BY l.createdAt DESC LIMIT 25
   `).all();
 
+  const payments = db.prepare(`SELECT p.id, p.userId, p.amount, p.status, p.ipAddress, p.createdAt, u.name as userName, u.email as userEmail FROM Payment p LEFT JOIN User u ON u.id = p.userId ORDER BY p.createdAt DESC`).all();
+  const disputes = db.prepare(`SELECT d.*, u.name as customerName, u.email as customerEmail FROM CustomerDispute d JOIN User u ON u.id = d.customerId ORDER BY d.createdAt DESC`).all();
+  const protectedCustomers = db.prepare('SELECT id, name, email, parentEmail, parentalGateOn FROM User WHERE parentalGateOn = 1').all().map((u: any) => ({ ...u, parentalGateOn: Boolean(u.parentalGateOn) }));
+
   res.json({
     logs,
     blocklist,
     frozenUsers,
     loginActivities,
+    payments,
+    disputes,
+    protectedCustomers,
   });
+});
+
+app.post('/api/security/logs/:id/action', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
+  const sessionUser = (req as any).user as SessionUser;
+  const log = db.prepare('SELECT id FROM SecurityLog WHERE id = ?').get(req.params.id);
+  if (!log) return res.status(404).json({ error: 'Security alert not found.' });
+  const action = String(req.body?.action || '');
+  if (!['REVIEW', 'ESCALATE', 'RESOLVE'].includes(action)) return res.status(400).json({ error: 'Choose review, escalate, or resolve.' });
+  if (action === 'RESOLVE') db.prepare('UPDATE SecurityLog SET resolved = 1 WHERE id = ?').run(req.params.id);
+  db.prepare('INSERT INTO AuditLog (id, actorId, action, entityType, entityId, metadata, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)').run(`audit_${crypto.randomBytes(5).toString('hex')}`, sessionUser.id, `SECURITY_${action}`, 'SecurityLog', req.params.id, JSON.stringify({ action }), new Date().toISOString());
+  res.json({ message: action === 'REVIEW' ? 'Alert marked as reviewed.' : action === 'ESCALATE' ? 'Alert escalated for priority review.' : 'Alert resolved.' });
 });
 
 app.post('/api/security/simulate-geo-jump', requireAuth(['ADMIN', 'STAFF']), (req, res) => {

@@ -78,9 +78,16 @@ export const DiscountInputSchema = z.object({
   value: z.number().int().positive(),
   minQuantity: z.number().int().min(1).default(1),
   maxUses: z.number().int().min(1).default(100),
+  minPurchaseCents: z.number().int().min(0).default(0),
+  productIds: z.array(z.string()).default([]),
+  planIds: z.array(z.string()).default([]),
+  customerEligibility: z.enum(['ALL', 'NEW', 'EXISTING']).default('ALL'),
   startDate: z.string(),
   endDate: z.string(),
   isActive: z.boolean().default(true),
+}).refine((discount) => discount.type !== 'PERCENT' || discount.value <= 100, {
+  message: 'Percentage discounts cannot exceed 100%.',
+  path: ['value'],
 });
 
 export const CheckoutRateLimitSchema = z.object({

@@ -129,6 +129,10 @@ export function initDatabase() {
       minQuantity INTEGER NOT NULL DEFAULT 1,
       maxUses INTEGER NOT NULL DEFAULT 100,
       usedCount INTEGER NOT NULL DEFAULT 0,
+      minPurchaseCents INTEGER NOT NULL DEFAULT 0,
+      productIdsJson TEXT NOT NULL DEFAULT '[]',
+      planIdsJson TEXT NOT NULL DEFAULT '[]',
+      customerEligibility TEXT NOT NULL DEFAULT 'ALL',
       startDate TEXT NOT NULL,
       endDate TEXT NOT NULL,
       isActive INTEGER NOT NULL DEFAULT 1,
@@ -203,6 +207,12 @@ export function initDatabase() {
       updatedAt TEXT NOT NULL
     );
   `);
+
+  const discountColumns = new Set((db.prepare('PRAGMA table_info(Discount)').all() as Array<{ name: string }>).map(column => column.name));
+  if (!discountColumns.has('minPurchaseCents')) db.exec('ALTER TABLE Discount ADD COLUMN minPurchaseCents INTEGER NOT NULL DEFAULT 0');
+  if (!discountColumns.has('productIdsJson')) db.exec("ALTER TABLE Discount ADD COLUMN productIdsJson TEXT NOT NULL DEFAULT '[]'");
+  if (!discountColumns.has('planIdsJson')) db.exec("ALTER TABLE Discount ADD COLUMN planIdsJson TEXT NOT NULL DEFAULT '[]'");
+  if (!discountColumns.has('customerEligibility')) db.exec("ALTER TABLE Discount ADD COLUMN customerEligibility TEXT NOT NULL DEFAULT 'ALL'");
 }
 
 export function seedDatabase(forceReset = false) {
