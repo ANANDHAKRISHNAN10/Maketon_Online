@@ -1218,7 +1218,49 @@ app.put('/api/admin/discounts/:id', requireAuth(['ADMIN', 'STAFF']), (req, res) 
 
 app.get('/api/intelligence/revenue-leakage', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
   const report = detectRevenueLeakage();
-  res.json(report);
+  const workflows = db.prepare(`SELECT * FROM AuditLog WHERE (entityType = 'LeakageIssue' OR action = 'RECONCILE_LEAKAGE') ORDER BY createdAt DESC`).all() as any[];
+  const latest = new Map<string, any>();
+  workflows.forEach((row) => {
+    const meta = JSON.parse(row.metadata || '{}');
+    const issueId = meta.issueId || row.entityId;
+    if (issueId && !latest.has(issueId)) latest.set(issueId, { ...row, details: meta });
+  });
+  const resolvedActions = workflows.filter(row => ['RECONCILE_LEAKAGE','RESOLVE_LEAKAGE_ISSUE'].includes(row.action));
+  const resolved = new Map<string, any>();
+  resolvedActions.forEach((row) => {
+    const meta = JSON.parse(row.metadata || '{}'); const issueId = meta.issueId || row.entityId;
+    if (!issueId || resolved.has(issueId)) return;
+    const snapshot = meta.issueSnapshot || {};
+    resolved.set(issueId, { ...snapshot, id: issueId, issueType: snapshot.issueType || row.entityType, title: snapshot.title || meta.resolutionSummary || 'Revenue finding resolved', customerName: snapshot.customerName || 'Customer record', customerEmail: snapshot.customerEmail || '', userId: snapshot.userId || '', entityId: snapshot.entityId || row.entityId, financialImpactCents: Number(snapshot.financialImpactCents ?? meta.impactRecoveredCents ?? 0), severity: snapshot.severity || 'MEDIUM', suggestedCorrection: snapshot.suggestedCorrection || 'Review reconciliation history.', forensicDetails: snapshot.forensicDetails || {}, status: 'RESOLVED', detectedAt: snapshot.detectedAt || row.createdAt, resolvedAt: row.createdAt, resolutionSummary: meta.resolutionSummary || 'Marked resolved by staff.' });
+  });
+  const issues = report.issues.filter(issue => !resolved.has(issue.id)).map(issue => {
+    const workflow = latest.get(issue.id);
+    return { ...issue, status: workflow?.action === 'ASSIGN_LEAKAGE_ISSUE' ? 'ASSIGNED' : 'PENDING', assignedTo: workflow?.details?.assigneeName || '', assignedToId: workflow?.details?.assigneeId || '' };
+  });
+  const resolvedIssues = [...resolved.values()];
+  const uniqueImpact = new Map<string, number>();
+  issues.forEach(issue => uniqueImpact.set(issue.impactKey || issue.id, Math.max(uniqueImpact.get(issue.impactKey || issue.id) || 0, issue.financialImpactCents)));
+  const currentLeakageCents = [...uniqueImpact.values()].reduce((sum, value) => sum + value, 0);
+  const staff = db.prepare(`SELECT id, name, email, role FROM User WHERE role IN ('ADMIN','STAFF') ORDER BY role, name`).all();
+  res.json({ ...report, issues, totalLeakageCents: currentLeakageCents, potentiallyRecoverableCents: currentLeakageCents, resolvedIssues, totalDetectedIssues: issues.length + resolvedIssues.length, resolvedCount: resolvedIssues.length, pendingCount: issues.filter(issue => issue.status === 'PENDING').length, assignedCount: issues.filter(issue => issue.status === 'ASSIGNED').length, staff });
+});
+
+app.post('/api/intelligence/leakage-action', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
+  const sessionUser = (req as any).user as SessionUser;
+  const { issueId, action, assigneeId } = req.body || {};
+  const issue = detectRevenueLeakage().issues.find(item => item.id === String(issueId || ''));
+  if (!issue) return res.status(404).json({ error: 'Finding not found or already resolved.' });
+  if (!['RESOLVE','ASSIGN'].includes(String(action))) return res.status(400).json({ error: 'Choose resolve or assign.' });
+  let metadata: any = { issueId: issue.id, issueSnapshot: issue };
+  if (action === 'ASSIGN') {
+    const assignee = db.prepare(`SELECT id, name, role FROM User WHERE id = ? AND role IN ('ADMIN','STAFF')`).get(String(assigneeId || '')) as any;
+    if (!assignee) return res.status(400).json({ error: 'Select an admin or staff member.' });
+    metadata = { ...metadata, assigneeId: assignee.id, assigneeName: assignee.name };
+  }
+  const actionName = action === 'RESOLVE' ? 'RESOLVE_LEAKAGE_ISSUE' : 'ASSIGN_LEAKAGE_ISSUE';
+  db.prepare(`INSERT INTO AuditLog (id, actorId, action, entityType, entityId, metadata, createdAt) VALUES (?, ?, ?, 'LeakageIssue', ?, ?, ?)`)
+    .run(`aud_${crypto.randomBytes(5).toString('hex')}`, sessionUser.id, actionName, issue.id, JSON.stringify(metadata), new Date().toISOString());
+  res.json({ message: action === 'RESOLVE' ? 'Finding marked resolved.' : 'Finding assigned to staff.', issueId: issue.id });
 });
 
 app.post('/api/intelligence/fix-leakage', requireAuth(['ADMIN', 'STAFF']), (req, res) => {

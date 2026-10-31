@@ -594,7 +594,9 @@ export interface LeakageIssue {
     | 'ACTIVE_SUB_WITHOUT_INVOICE'
     | 'DUPLICATE_PERIOD_INVOICE'
     | 'EXPIRED_DISCOUNT_ON_DRAFT'
-    | 'UNLINKED_SUCCESS_PAYMENT';
+    | 'UNLINKED_SUCCESS_PAYMENT'
+    | 'MISSED_RECURRING_PAYMENT'
+    | 'INCORRECT_TAX_CALCULATION';
   title: string;
   customerName: string;
   customerEmail: string;
@@ -604,12 +606,16 @@ export interface LeakageIssue {
   severity: 'CRITICAL' | 'HIGH' | 'MEDIUM';
   suggestedCorrection: string;
   forensicDetails: Record<string, any>;
+  impactKey?: string;
+  detectedAt?: string;
 }
 
 export function detectRevenueLeakage(): {
   issues: LeakageIssue[];
   totalLeakageCents: number;
+  potentiallyRecoverableCents: number;
   summaryByType: Record<string, number>;
+  coverageGaps: Array<{ issueType: string; reason: string }>;
 } {
   const issues: LeakageIssue[] = [];
   const nowIso = new Date().toISOString();
@@ -639,6 +645,7 @@ export function detectRevenueLeakage(): {
       userId: row.userId,
       entityId: row.subId,
       financialImpactCents: withTax,
+      impactKey: `period:${row.subId}:${String(row.currentPeriodStart || '').slice(0,7)}`,
       severity: 'CRITICAL',
       suggestedCorrection: `Generate confirmed invoice for ${row.planName} ($${(row.planPrice / 100).toFixed(2)} + 18% GST = $${(withTax / 100).toFixed(2)}).`,
       forensicDetails: {
@@ -678,6 +685,7 @@ export function detectRevenueLeakage(): {
       userId: dup.userId,
       entityId: duplicateInvId,
       financialImpactCents: dup.duplicateAmount,
+      impactKey: `period:${dup.subscriptionId}:${dup.billingPeriodKey}`,
       severity: 'HIGH',
       suggestedCorrection: `Cancel redundant invoice ${String(dup.invoiceNumbers).split(',').pop()} and retain primary period invoice.`,
       forensicDetails: {
@@ -686,13 +694,14 @@ export function detectRevenueLeakage(): {
         invoiceCount: dup.invCount,
         invoiceNumbers: dup.invoiceNumbers,
         duplicateInvoiceId: duplicateInvId,
+        invoiceId: duplicateInvId,
       },
     });
   }
 
   // 3. Expired discounts applied to draft invoices
   const expiredDraftInvoices = db.prepare(`
-    SELECT i.id as invoiceId, i.invoiceNumber, i.amountSubtotal, i.discountAmount, i.discountCode, i.totalAmount,
+    SELECT i.id as invoiceId, i.invoiceNumber, i.subscriptionId, i.billingPeriodKey, i.amountSubtotal, i.discountAmount, i.discountCode, i.totalAmount,
            u.id as userId, u.name as userName, u.email as userEmail,
            d.endDate as discountEndDate, d.isActive as discountActive
     FROM Invoice i
@@ -713,10 +722,12 @@ export function detectRevenueLeakage(): {
       userId: exp.userId,
       entityId: exp.invoiceId,
       financialImpactCents: exp.discountAmount + Math.round(exp.discountAmount * 0.18),
+      impactKey: `period:${exp.subscriptionId}:${exp.billingPeriodKey}`,
       severity: 'HIGH',
       suggestedCorrection: `Strip expired promo ${exp.discountCode} from ${exp.invoiceNumber} and recalculate 18% GST.`,
       forensicDetails: {
         invoiceId: exp.invoiceId,
+        subscriptionId: exp.subscriptionId,
         invoiceNumber: exp.invoiceNumber,
         expiredDiscountCode: exp.discountCode,
         discountEndDate: exp.discountEndDate,
@@ -744,6 +755,7 @@ export function detectRevenueLeakage(): {
       userId: pay.userId,
       entityId: pay.paymentId,
       financialImpactCents: pay.amount,
+      impactKey: `payment:${pay.paymentId}`,
       severity: 'CRITICAL',
       suggestedCorrection: `Create & link reconciled PAID invoice for settlement reference ${pay.referenceCode}.`,
       forensicDetails: {
@@ -756,13 +768,46 @@ export function detectRevenueLeakage(): {
     });
   }
 
-  const totalLeakageCents = issues.reduce((sum, i) => sum + i.financialImpactCents, 0);
+  // 5. Recurring invoices past due without a successful payment.
+  const missedRenewals = db.prepare(`
+    SELECT i.id as invoiceId, i.invoiceNumber, i.subscriptionId, i.billingPeriodKey, i.totalAmount, i.dueDate, i.createdAt,
+           u.id as userId, u.name as userName, u.email as userEmail, p.name as planName
+    FROM Invoice i JOIN User u ON u.id = i.userId JOIN Subscription s ON s.id = i.subscriptionId
+    JOIN Plan p ON p.id = s.planId
+    WHERE i.status IN ('CONFIRMED','OVERDUE') AND i.dueDate < ?
+      AND EXISTS (SELECT 1 FROM Invoice prior WHERE prior.subscriptionId = i.subscriptionId AND prior.id != i.id)
+      AND NOT EXISTS (SELECT 1 FROM Payment pay WHERE pay.invoiceId = i.id AND pay.status = 'SUCCESS')
+  `).all(nowIso) as any[];
+  for (const inv of missedRenewals) {
+    issues.push({ id:`leak_missed_renewal_${inv.invoiceId}`, issueType:'MISSED_RECURRING_PAYMENT', title:`Past-due recurring invoice ${inv.invoiceNumber}`, customerName:inv.userName, customerEmail:inv.userEmail, userId:inv.userId, entityId:inv.invoiceId, financialImpactCents:inv.totalAmount, impactKey:`period:${inv.subscriptionId}:${inv.billingPeriodKey}`, severity:'HIGH', suggestedCorrection:`Review and collect invoice ${inv.invoiceNumber} for ${inv.planName}; check payment status before retrying.`, forensicDetails:{invoiceId:inv.invoiceId,invoiceNumber:inv.invoiceNumber,subscriptionId:inv.subscriptionId,billingPeriodKey:inv.billingPeriodKey,dueDate:inv.dueDate,amountCents:inv.totalAmount} });
+  }
+
+  // 6. Tax mismatches are checked against the configured prototype GST rate (18%).
+  const taxRate = Number(process.env.GST_TAX_RATE_PERCENT || 18);
+  const invoices = db.prepare(`SELECT i.id, i.invoiceNumber, i.subscriptionId, i.billingPeriodKey, i.userId, i.amountSubtotal, i.taxAmount, i.discountAmount, i.status, i.dueDate,
+      u.name as userName, u.email as userEmail
+    FROM Invoice i JOIN User u ON u.id = i.userId WHERE i.status != 'CANCELLED'`).all() as any[];
+  for (const inv of invoices) {
+    const expectedTax = Math.round(Math.max(0, inv.amountSubtotal - inv.discountAmount) * taxRate / 100);
+    const delta = Math.abs(expectedTax - inv.taxAmount);
+    if (delta >= 2) issues.push({ id:`leak_tax_${inv.id}`, issueType:'INCORRECT_TAX_CALCULATION', title:`Tax mismatch on ${inv.invoiceNumber}`, customerName:inv.userName, customerEmail:inv.userEmail, userId:inv.userId, entityId:inv.id, financialImpactCents:delta, impactKey:`period:${inv.subscriptionId}:${inv.billingPeriodKey}`, severity:delta >= 1000?'HIGH':'MEDIUM', suggestedCorrection:`Recalculate tax at ${taxRate}% on the post-discount subtotal and update ${inv.invoiceNumber}.`, forensicDetails:{invoiceId:inv.id,invoiceNumber:inv.invoiceNumber,subscriptionId:inv.subscriptionId,billingPeriodKey:inv.billingPeriodKey,recordedTaxCents:inv.taxAmount,expectedTaxCents:expectedTax,taxRatePercent:taxRate,status:inv.status} });
+  }
+
+  // Keep the largest supported impact per underlying record so one invoice cannot
+  // inflate the headline when it triggers multiple related checks.
+  const impactByRecord = new Map<string, number>();
+  issues.forEach((issue) => impactByRecord.set(issue.impactKey || issue.id, Math.max(impactByRecord.get(issue.impactKey || issue.id) || 0, issue.financialImpactCents)));
+  issues.forEach(issue => { issue.detectedAt = nowIso; });
+  const totalLeakageCents = [...impactByRecord.values()].reduce((sum, amount) => sum + amount, 0);
   const summaryByType = issues.reduce((acc, item) => {
     acc[item.issueType] = (acc[item.issueType] || 0) + item.financialImpactCents;
     return acc;
   }, {} as Record<string, number>);
 
-  return { issues, totalLeakageCents, summaryByType };
+  return { issues, totalLeakageCents, potentiallyRecoverableCents: totalLeakageCents, summaryByType, coverageGaps: [
+    { issueType: 'INCORRECT_PRODUCT_QUANTITY', reason: 'The current billing schema has no purchased product line items or quantities to compare against invoices.' },
+    { issueType: 'MISSING_ADD_ON_CHARGE', reason: 'The current billing schema does not associate purchased add-ons with subscriptions or invoice lines.' },
+  ] };
 }
 
 export function fixSingleLeakageIssue(issueId: string, actorId: string) {
@@ -835,7 +880,7 @@ export function fixSingleLeakageIssue(issueId: string, actorId: string) {
       actorId,
       target.issueType,
       target.entityId,
-      JSON.stringify({ issueId: target.id, resolutionSummary, impactRecoveredCents: target.financialImpactCents }),
+      JSON.stringify({ issueId: target.id, issueSnapshot: target, resolutionSummary, impactRecoveredCents: target.financialImpactCents }),
       now.toISOString()
     );
 
