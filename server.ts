@@ -199,12 +199,22 @@ app.post('/api/auth/login', (req, res) => {
   const { email, password, simulatedCountry } = parsed.data;
   const user = db.prepare('SELECT * FROM User WHERE email = ?').get(email.toLowerCase()) as any;
   if (!user || user.passwordHash !== hashPassword(password)) {
+    if (user) {
+      const nowIso = new Date().toISOString();
+      const failures = (db.prepare("SELECT COUNT(*) as count FROM SecurityLog WHERE userId = ? AND eventType = 'LOGIN_FAILED' AND createdAt >= ?").get(user.id, new Date(Date.now() - 15 * 60 * 1000).toISOString()) as any).count + 1;
+      const severity = failures >= 5 ? 'HIGH' : failures >= 3 ? 'MEDIUM' : 'LOW';
+      db.prepare(`INSERT INTO SecurityLog (id, userId, ipAddress, userAgent, eventType, severity, details, resolved, createdAt) VALUES (?, ?, ?, ?, 'LOGIN_FAILED', ?, ?, 0, ?)`)
+        .run(`sec_login_${crypto.randomBytes(4).toString('hex')}`, user.id, (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown', req.headers['user-agent'] || 'Browser', severity, JSON.stringify({ failedAttempts: failures, windowMinutes: 15, description: `${failures} unsuccessful sign-in attempts were recorded for this account in 15 minutes.` }), nowIso);
+    }
     return res.status(401).json({ error: 'Invalid email or password.' });
   }
 
   const now = new Date();
   const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.socket.remoteAddress || '203.0.113.10';
   const loginCountry = simulatedCountry || user.lastLoginCountry || 'US';
+  const currentAgent = req.headers['user-agent'] || 'Browser';
+  const previousLogin = db.prepare('SELECT userAgent FROM LoginActivity WHERE userId = ? ORDER BY createdAt DESC LIMIT 1').get(user.id) as any;
+  const newDevice = Boolean(previousLogin && previousLogin.userAgent !== currentAgent);
 
   // Geo-IP Jump Detection: Login from different country within 1 hour
   let geoJumpDetected = false;
@@ -255,6 +265,11 @@ app.post('/api/auth/login', (req, res) => {
     geoJumpDetected ? 1 : 0,
     now.toISOString()
   );
+
+  if (newDevice) {
+    db.prepare(`INSERT INTO SecurityLog (id, userId, ipAddress, userAgent, eventType, severity, details, resolved, createdAt) VALUES (?, ?, ?, ?, 'NEW_DEVICE_LOGIN', 'MEDIUM', ?, 0, ?)`)
+      .run(`sec_device_${crypto.randomBytes(4).toString('hex')}`, user.id, clientIp, currentAgent, JSON.stringify({ country: loginCountry, description: 'A successful sign-in used a browser or device signature not seen on the previous recorded sign-in.' }), now.toISOString());
+  }
 
   const sessionUser: SessionUser = {
     id: user.id,
@@ -555,11 +570,16 @@ app.post('/api/gamer/parental-settings', requireAuth(), (req, res) => {
   }
 
   const { parentEmail, parentalPin, parentalGateOn } = parsed.data;
+  const previous = db.prepare('SELECT parentEmail FROM User WHERE id = ?').get(sessionUser.id) as any;
   db.prepare(`
     UPDATE User
     SET parentEmail = ?, parentalPinHash = ?, parentalGateOn = ?
     WHERE id = ?
   `).run(parentEmail || null, hashPin(parentalPin), parentalGateOn ? 1 : 0, sessionUser.id);
+  if ((previous?.parentEmail || null) !== (parentEmail || null)) {
+    db.prepare(`INSERT INTO AuditLog (id, actorId, action, entityType, entityId, metadata, createdAt) VALUES (?, ?, 'ACCOUNT_OWNERSHIP_CHANGE', 'Customer', ?, ?, ?)`)
+      .run(`aud_${crypto.randomBytes(4).toString('hex')}`, sessionUser.id, sessionUser.id, JSON.stringify({ relationshipContactChanged: true, source: 'PARENTAL_SETTINGS' }), new Date().toISOString());
+  }
 
   res.json({
     message: `Parental Safety Gate ${parentalGateOn ? 'enabled' : 'updated'} with 4-digit PIN protection.`,
@@ -575,11 +595,16 @@ app.put('/api/gamer/profile', requireAuth(), (req, res) => {
   if (!name || String(name).trim().length < 2) {
     return res.status(400).json({ error: 'Display name must be at least 2 characters.' });
   }
+  const previous = db.prepare('SELECT name, parentEmail FROM User WHERE id = ?').get(sessionUser.id) as any;
   db.prepare('UPDATE User SET name = ?, parentEmail = ? WHERE id = ?').run(
     String(name).trim(),
     parentEmail || null,
     sessionUser.id
   );
+  if ((previous?.parentEmail || null) !== (parentEmail || null) || previous?.name !== String(name).trim()) {
+    db.prepare(`INSERT INTO AuditLog (id, actorId, action, entityType, entityId, metadata, createdAt) VALUES (?, ?, 'ACCOUNT_OWNERSHIP_CHANGE', 'Customer', ?, ?, ?)`)
+      .run(`aud_${crypto.randomBytes(4).toString('hex')}`, sessionUser.id, sessionUser.id, JSON.stringify({ displayNameChanged: previous?.name !== String(name).trim(), relationshipContactChanged: (previous?.parentEmail || null) !== (parentEmail || null), source: 'PROFILE' }), new Date().toISOString());
+  }
   res.json({ message: 'Profile updated successfully.' });
 });
 
@@ -599,11 +624,15 @@ app.post('/api/gamer/invoices/:id/pay', requireAuth(), (req, res) => {
   const user = db.prepare('SELECT * FROM User WHERE id = ?').get(inv.userId) as any;
   if (user?.parentalGateOn && sessionUser.role === 'GAMER') {
     if (!parentalPin || user.parentalPinHash !== hashPin(String(parentalPin))) {
+      db.prepare(`INSERT INTO AuditLog (id, actorId, action, entityType, entityId, metadata, createdAt) VALUES (?, ?, 'PARENTAL_AUTH_REQUEST', 'Customer', ?, ?, ?)`)
+        .run(`aud_${crypto.randomBytes(4).toString('hex')}`, sessionUser.id, user.id, JSON.stringify({ status: parentalPin ? 'DENIED' : 'REQUESTED', invoiceId: inv.id, invoiceNumber: inv.invoiceNumber, amountCents: inv.totalAmount }), new Date().toISOString());
       return res.status(403).json({
         error: 'PARENTAL_PIN_REQUIRED',
         message: 'Valid 4-digit Parental PIN is required to authorize renewal payment.',
       });
     }
+    db.prepare(`INSERT INTO AuditLog (id, actorId, action, entityType, entityId, metadata, createdAt) VALUES (?, ?, 'PARENTAL_AUTH_REQUEST', 'Customer', ?, ?, ?)`)
+      .run(`aud_${crypto.randomBytes(4).toString('hex')}`, sessionUser.id, user.id, JSON.stringify({ status: 'AUTHORIZED', invoiceId: inv.id, invoiceNumber: inv.invoiceNumber, amountCents: inv.totalAmount }), new Date().toISOString());
   }
 
   const nowIso = new Date().toISOString();
@@ -1314,9 +1343,12 @@ app.get('/api/security/dashboard', requireAuth(['ADMIN', 'STAFF']), (_req, res) 
     ORDER BY l.createdAt DESC LIMIT 25
   `).all();
 
-  const payments = db.prepare(`SELECT p.id, p.userId, p.amount, p.status, p.ipAddress, p.createdAt, u.name as userName, u.email as userEmail FROM Payment p LEFT JOIN User u ON u.id = p.userId ORDER BY p.createdAt DESC`).all();
+  const payments = db.prepare(`SELECT p.id, p.userId, p.invoiceId, p.amount, p.status, p.ipAddress, p.createdAt, u.name as userName, u.email as userEmail, i.invoiceNumber FROM Payment p LEFT JOIN User u ON u.id = p.userId LEFT JOIN Invoice i ON i.id = p.invoiceId ORDER BY p.createdAt DESC`).all();
   const disputes = db.prepare(`SELECT d.*, u.name as customerName, u.email as customerEmail FROM CustomerDispute d JOIN User u ON u.id = d.customerId ORDER BY d.createdAt DESC`).all();
   const protectedCustomers = db.prepare('SELECT id, name, email, parentEmail, parentalGateOn FROM User WHERE parentalGateOn = 1').all().map((u: any) => ({ ...u, parentalGateOn: Boolean(u.parentalGateOn) }));
+  const protectedSubscriptions = db.prepare(`SELECT s.id, s.userId, s.status, s.currentPeriodEnd, p.name as planName, p.billingPeriod, p.price, u.name as customerName FROM Subscription s JOIN User u ON u.id = s.userId JOIN Plan p ON p.id = s.planId WHERE u.parentalGateOn = 1 ORDER BY s.currentPeriodEnd ASC`).all();
+  const ownershipChanges = db.prepare(`SELECT a.id, a.entityId as userId, a.metadata, a.createdAt, u.name as customerName, u.email as customerEmail FROM AuditLog a LEFT JOIN User u ON u.id = a.entityId WHERE a.entityType = 'Customer' AND a.action = 'ACCOUNT_OWNERSHIP_CHANGE' ORDER BY a.createdAt DESC LIMIT 25`).all().map((a: any) => ({ ...a, details: JSON.parse(a.metadata || '{}') }));
+  const parentalAuthorizationRequests = db.prepare(`SELECT a.id, a.entityId as userId, a.metadata, a.createdAt, u.name as customerName FROM AuditLog a LEFT JOIN User u ON u.id = a.entityId WHERE a.action = 'PARENTAL_AUTH_REQUEST' ORDER BY a.createdAt DESC LIMIT 25`).all().map((a: any) => ({ ...a, details: JSON.parse(a.metadata || '{}') }));
 
   res.json({
     logs,
@@ -1326,6 +1358,9 @@ app.get('/api/security/dashboard', requireAuth(['ADMIN', 'STAFF']), (_req, res) 
     payments,
     disputes,
     protectedCustomers,
+    protectedSubscriptions,
+    ownershipChanges,
+    parentalAuthorizationRequests,
   });
 });
 
