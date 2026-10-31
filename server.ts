@@ -790,6 +790,91 @@ app.get('/api/admin/overview', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
   });
 });
 
+// --- ADMIN SUBSCRIPTION MANAGEMENT ---
+app.get('/api/admin/subscriptions', requireAuth(['ADMIN', 'STAFF']), (_req, res) => {
+  const subscriptions = db.prepare(`
+    SELECT s.*, u.name as customerName, u.email as customerEmail, u.role as customerRole,
+           u.parentEmail, u.parentalGateOn, p.name as planName, p.billingPeriod,
+           p.price as planPrice, p.allowPause, p.maxPauseDays
+    FROM Subscription s
+    JOIN User u ON u.id = s.userId
+    JOIN Plan p ON p.id = s.planId
+    ORDER BY s.createdAt DESC
+  `).all().map((subscription: any) => ({
+    ...subscription,
+    allowPause: Boolean(subscription.allowPause),
+    parentalGateOn: Boolean(subscription.parentalGateOn),
+    invoices: db.prepare('SELECT * FROM Invoice WHERE subscriptionId = ? ORDER BY createdAt DESC').all(subscription.id),
+    payments: db.prepare(`
+      SELECT p.*, i.invoiceNumber FROM Payment p
+      LEFT JOIN Invoice i ON i.id = p.invoiceId
+      WHERE p.userId = ? ORDER BY p.createdAt DESC
+    `).all(subscription.userId),
+    pauseHistory: db.prepare('SELECT * FROM PauseHistory WHERE subscriptionId = ? ORDER BY createdAt DESC').all(subscription.id),
+    activityLogs: db.prepare(`SELECT * FROM AuditLog WHERE entityType = 'Subscription' AND entityId = ? ORDER BY createdAt DESC`).all(subscription.id),
+  }));
+  const plans = db.prepare('SELECT id, name, billingPeriod, price, allowPause FROM Plan ORDER BY price ASC').all();
+  res.json({ subscriptions, plans });
+});
+
+app.put('/api/admin/subscriptions/:id', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
+  const { planId, currentPeriodStart, currentPeriodEnd } = req.body || {};
+  const subscription = db.prepare('SELECT * FROM Subscription WHERE id = ?').get(req.params.id) as any;
+  if (!subscription) return res.status(404).json({ error: 'Subscription not found.' });
+  if (planId && !db.prepare('SELECT id FROM Plan WHERE id = ?').get(planId)) {
+    return res.status(400).json({ error: 'Select a valid subscription plan.' });
+  }
+  const start = currentPeriodStart || subscription.currentPeriodStart;
+  const end = currentPeriodEnd || subscription.currentPeriodEnd;
+  if (!Number.isFinite(Date.parse(start)) || !Number.isFinite(Date.parse(end)) || new Date(end) <= new Date(start)) {
+    return res.status(400).json({ error: 'Expiry date must be after the start date.' });
+  }
+  db.prepare(`UPDATE Subscription SET planId = ?, currentPeriodStart = ?, currentPeriodEnd = ? WHERE id = ?`)
+    .run(planId || subscription.planId, new Date(start).toISOString(), new Date(end).toISOString(), subscription.id);
+  const actor = (req as any).user as SessionUser;
+  db.prepare(`INSERT INTO AuditLog (id, actorId, action, entityType, entityId, metadata, createdAt) VALUES (?, ?, 'EDIT_SUBSCRIPTION', 'Subscription', ?, ?, ?)`)
+    .run(`aud_${crypto.randomBytes(5).toString('hex')}`, actor.id, subscription.id, JSON.stringify({ planId: planId || subscription.planId, currentPeriodStart: start, currentPeriodEnd: end }), new Date().toISOString());
+  res.json({ message: 'Subscription updated.', subscriptionId: subscription.id });
+});
+
+app.post('/api/admin/subscriptions/:id/renew', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
+  const sub = db.prepare(`SELECT s.*, p.name as planName, p.billingPeriod, p.price, u.email as customerEmail
+    FROM Subscription s JOIN Plan p ON p.id = s.planId JOIN User u ON u.id = s.userId WHERE s.id = ?`).get(req.params.id) as any;
+  if (!sub) return res.status(404).json({ error: 'Subscription not found.' });
+  const now = new Date();
+  const days = sub.billingPeriod === 'DAILY' ? 1 : sub.billingPeriod === 'WEEKLY' ? 7 : sub.billingPeriod === 'QUARTERLY' ? 90 : sub.billingPeriod === 'YEARLY' ? 365 : 30;
+  const periodEnd = new Date(now.getTime() + days * 86400000);
+  const subtotal = sub.price;
+  const tax = Math.round(subtotal * Number(process.env.GST_TAX_RATE_PERCENT || 18) / 100);
+  const invoiceId = `inv_${crypto.randomBytes(5).toString('hex')}`;
+  const invoiceNumber = `BL-${now.getUTCFullYear()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+  const periodKey = `${now.getUTCFullYear()}-${String(now.getUTCMonth()+1).padStart(2,'0')}-renew-${crypto.randomBytes(2).toString('hex')}`;
+  const actor = (req as any).user as SessionUser;
+  const tx = db.transaction(() => {
+    db.prepare(`UPDATE Subscription SET status = 'ACTIVE', currentPeriodStart = ?, currentPeriodEnd = ?, perksFrozen = 0,
+      pauseStartDate = NULL, pauseResumeDate = NULL, pausedDaysPlanned = NULL WHERE id = ?`)
+      .run(now.toISOString(), periodEnd.toISOString(), sub.id);
+    db.prepare(`INSERT INTO Invoice (id, invoiceNumber, subscriptionId, userId, billingPeriodKey, amountSubtotal, taxAmount, discountAmount, totalAmount, status, dueDate, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 'CONFIRMED', ?, ?)`)
+      .run(invoiceId, invoiceNumber, sub.id, sub.userId, periodKey, subtotal, tax, subtotal + tax, new Date(now.getTime()+7*86400000).toISOString(), now.toISOString());
+    db.prepare(`INSERT INTO AuditLog (id, actorId, action, entityType, entityId, metadata, createdAt) VALUES (?, ?, 'ADMIN_RENEW_SUBSCRIPTION', 'Subscription', ?, ?, ?)`)
+      .run(`aud_${crypto.randomBytes(5).toString('hex')}`, actor.id, sub.id, JSON.stringify({ invoiceNumber, currentPeriodEnd: periodEnd.toISOString() }), now.toISOString());
+  });
+  tx();
+  res.json({ message: 'Subscription renewed and invoice created.', invoiceNumber, currentPeriodEnd: periodEnd.toISOString() });
+});
+
+app.post('/api/admin/invoices/:id/approve', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
+  const invoice = db.prepare('SELECT * FROM Invoice WHERE id = ?').get(req.params.id) as any;
+  if (!invoice) return res.status(404).json({ error: 'Invoice or quotation not found.' });
+  if (invoice.status !== 'DRAFT') return res.status(400).json({ error: 'Only draft quotations can be approved.' });
+  db.prepare(`UPDATE Invoice SET status = 'CONFIRMED' WHERE id = ?`).run(invoice.id);
+  const actor = (req as any).user as SessionUser;
+  db.prepare(`INSERT INTO AuditLog (id, actorId, action, entityType, entityId, metadata, createdAt) VALUES (?, ?, 'APPROVE_QUOTATION', 'Invoice', ?, ?, ?)`)
+    .run(`aud_${crypto.randomBytes(5).toString('hex')}`, actor.id, invoice.id, JSON.stringify({ invoiceNumber: invoice.invoiceNumber }), new Date().toISOString());
+  res.json({ message: 'Quotation approved.', invoiceId: invoice.id });
+});
+
 // Plan CRUD
 app.post('/api/admin/plans', requireAuth(['ADMIN', 'STAFF']), (req, res) => {
   const parsed = PlanInputSchema.safeParse(req.body);

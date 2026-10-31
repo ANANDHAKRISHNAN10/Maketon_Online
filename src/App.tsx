@@ -15,6 +15,7 @@ import { LandingPlansPage } from './pages/PublicHome';
 import { CustomerLoyaltyPage } from './pages/CustomerLoyaltyPage';
 import { CustomerInvoicesPage } from './pages/CustomerInvoicesPage';
 import { AdminDashboardPage } from './pages/AdminDashboardPage';
+import { AdminSubscriptionsPage } from './pages/AdminSubscriptionsPage';
 
 function AppRoutes() {
   const { pathname } = useLocation();
@@ -42,7 +43,7 @@ function AppRoutes() {
                 <Route path="/customer/security" element={<FoundationPage />} />
                 <Route path="/admin/dashboard" element={<AdminDashboardPage />} />
                 <Route path="/admin/products" element={<FoundationPage />} />
-                <Route path="/admin/subscriptions" element={<FoundationPage />} />
+                <Route path="/admin/subscriptions" element={<AdminSubscriptionsPage />} />
                 <Route path="/admin/customers" element={<FoundationPage />} />
                 <Route path="/admin/billing" element={<FoundationPage />} />
                 <Route path="/admin/discounts" element={<FoundationPage />} />

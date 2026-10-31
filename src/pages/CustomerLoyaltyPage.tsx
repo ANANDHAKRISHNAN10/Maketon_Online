@@ -49,7 +49,7 @@ export function CustomerLoyaltyPage(){
   const eligibleToRedeem=(reward:Reward)=>state.available>=reward.points;
   const redeem=()=>{
     if(!selected)return;
-    if(!eligibleToRedeem(selected)){setNotice(`You need ${selected.points-state.available.toLocaleString()} more points to redeem this reward.`);setSelected(null);return;}
+    if(!eligibleToRedeem(selected)){setNotice(`You need ${(selected.points-state.available).toLocaleString()} more points to redeem this reward.`);setSelected(null);return;}
     const nextBalance=state.available-selected.points;
     const transaction:Transaction={id:`redeem-${Date.now()}`,date:new Date().toISOString().slice(0,10),activity:`Redeemed: ${selected.name}`,points:-selected.points,balance:nextBalance};
     const next:LoyaltyState={...state,available:nextBalance,redeemed:state.redeemed+selected.points,expiring:Math.max(0,state.expiring-Math.min(state.expiring,selected.points)),transactions:[transaction,...state.transactions]};
