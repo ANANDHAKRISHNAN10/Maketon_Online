@@ -10,13 +10,16 @@ import { AdminFinancePage } from './pages/AdminFinancePage';
 import { AdminSecurityPage } from './pages/AdminSecurityPage';
 import { AppShell } from './components/layout/AppShell';
 import { FoundationPage } from './pages/FoundationPage';
+import { CheckoutPage } from './pages/CheckoutPage';
+import { LandingPlansPage } from './pages/PublicHome';
 
 function AppRoutes() {
   const { pathname } = useLocation();
   const workspace = pathname.startsWith('/admin/') || pathname.startsWith('/customer/');
+  const landing = pathname === '/';
   return (
     <div className="min-h-screen flex flex-col bg-[#F5F4F0] text-stone-900">
-      {!workspace && <><Navbar /><RoleSwitcherBanner /></>}
+      {!workspace && !landing && <><Navbar /><RoleSwitcherBanner /></>}
       <main className="flex-1">
             <Routes>
               <Route path="/" element={<PublicHome />} />
@@ -45,8 +48,8 @@ function AppRoutes() {
                 <Route path="/admin/reports" element={<FoundationPage />} />
                 <Route path="/admin/settings" element={<FoundationPage />} />
               </Route>
-              <Route path="/plans" element={<Navigate to="/#subscription-plans" replace />} />
-              <Route path="/checkout" element={<Navigate to="/#subscription-plans" replace />} />
+              <Route path="/plans" element={<LandingPlansPage />} />
+              <Route path="/checkout" element={<CheckoutPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
       </main>
