@@ -1,0 +1,36 @@
+{
+  "name": "brightloop-gaming",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "db:push": "prisma db push",
+    "db:seed": "tsx prisma/seed.ts",
+    "test:api": "tsx scripts/test-apis.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.21.1",
+    "canvas-confetti": "^1.9.4",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.454.0",
+    "next": "^15.0.2",
+    "react": "^19.0.0-rc-66855b96-20241025",
+    "react-dom": "^19.0.0-rc-66855b96-20241025",
+    "tailwind-merge": "^2.5.4"
+  },
+  "devDependencies": {
+    "@types/canvas-confetti": "^1.9.0",
+    "@types/node": "^20.17.6",
+    "@types/react": "^19.0.0-rc-66855b96-20241025",
+    "@types/react-dom": "^19.0.0-rc-66855b96-20241025",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.47",
+    "prisma": "^5.21.1",
+    "tailwindcss": "^3.4.14",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
